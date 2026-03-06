@@ -1,0 +1,5 @@
+numpy>=1.26
+pyyaml>=6.0
+torch>=2.2
+torchvision>=0.17
+wandb>=0.19
