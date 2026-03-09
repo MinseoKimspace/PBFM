@@ -12,3 +12,10 @@ runtime:
 
 output:
   json: ""
+
+render:
+  dir: ""
+  count: 8
+  size: 1024
+  sample_steps: 64
+  seed: 1234

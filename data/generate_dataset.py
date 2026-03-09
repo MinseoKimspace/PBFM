@@ -62,6 +62,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--relax-steps", type=int, default=int(_get_nested(cfg, "relax", "steps", default=100)))
     parser.add_argument("--relax-lr", type=float, default=float(_get_nested(cfg, "relax", "lr", default=0.05)))
     parser.add_argument("--relax-batch-size", type=int, default=int(_get_nested(cfg, "relax", "batch_size", default=512)))
+    parser.add_argument(
+        "--hard-ground-projection",
+        dest="hard_ground_projection",
+        action="store_true",
+        default=bool(_get_nested(cfg, "relax", "hard_ground_projection", default=True)),
+    )
+    parser.add_argument("--no-hard-ground-projection", dest="hard_ground_projection", action="store_false")
 
     parser.add_argument("--gravity-weight", type=float, default=float(_get_nested(cfg, "physics", "gravity_weight", default=0.2)))
     parser.add_argument("--ground-weight", type=float, default=float(_get_nested(cfg, "physics", "ground_weight", default=0.2)))
@@ -128,21 +135,35 @@ def relax_states(
     relax_steps: int,
     relax_lr: float,
     xy_limit: float,
+    hard_ground_projection: bool,
 ) -> torch.Tensor:
     if relax_steps <= 0:
         return state_init.clone()
 
     state = state_init.to(device)
     radius = radius.to(device)
+    batch_scale = float(state.size(0))
+    ground_floor = None
+    if hard_ground_projection:
+        # Enforce non-penetration with the same ground convention used by the loss.
+        ground_floor = torch.clamp(
+            radius + float(physics_loss.y_ground),
+            min=0.0,
+            max=xy_limit,
+        )
 
     for _ in range(relax_steps):
         state = state.detach().requires_grad_(True)
         loss = physics_loss(state, radius)
         grad = torch.autograd.grad(loss, state, create_graph=False, retain_graph=False)[0]
         with torch.no_grad():
-            state = state - relax_lr * grad
+            state = state - relax_lr * grad * batch_scale
             state[..., 0].clamp_(-xy_limit, xy_limit)
-            state[..., 1].clamp_(0.0, xy_limit)
+            state[..., 1].clamp_max_(xy_limit)
+            if ground_floor is not None:
+                state[..., 1] = torch.maximum(state[..., 1], ground_floor)
+            else:
+                state[..., 1].clamp_min_(0.0)
     return state.detach().cpu()
 
 
@@ -180,6 +201,7 @@ def generate_split(
     relax_batch_size: int,
     physics_loss: PhysicsEnergyLoss,
     device: torch.device,
+    hard_ground_projection: bool,
 ) -> Dict[str, torch.Tensor]:
     state_init, radius = make_random_batch(
         num_samples=num_samples,
@@ -201,6 +223,7 @@ def generate_split(
             relax_steps=relax_steps,
             relax_lr=relax_lr,
             xy_limit=xy_limit,
+            hard_ground_projection=hard_ground_projection,
         )
         relaxed_chunks.append(chunk)
     state_relaxed = torch.cat(relaxed_chunks, dim=0).contiguous()
@@ -320,6 +343,7 @@ def main() -> None:
         relax_batch_size=args.relax_batch_size,
         physics_loss=physics_loss,
         device=device,
+        hard_ground_projection=args.hard_ground_projection,
     )
     val = generate_split(
         split_name="val",
@@ -334,6 +358,7 @@ def main() -> None:
         relax_batch_size=args.relax_batch_size,
         physics_loss=physics_loss,
         device=device,
+        hard_ground_projection=args.hard_ground_projection,
     )
     test = generate_split(
         split_name="test",
@@ -348,6 +373,7 @@ def main() -> None:
         relax_batch_size=args.relax_batch_size,
         physics_loss=physics_loss,
         device=device,
+        hard_ground_projection=args.hard_ground_projection,
     )
 
     payload = {
@@ -358,6 +384,7 @@ def main() -> None:
             "xy_limit": args.xy_limit,
             "relax_steps": args.relax_steps,
             "relax_lr": args.relax_lr,
+            "hard_ground_projection": args.hard_ground_projection,
             "gravity_weight": args.gravity_weight,
             "ground_weight": args.ground_weight,
             "collision_weight": args.collision_weight,

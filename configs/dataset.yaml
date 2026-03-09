@@ -13,6 +13,7 @@ relax:
   steps: 150
   lr: 0.05
   batch_size: 4096
+  hard_ground_projection: true
 
 physics:
   gravity_weight: 0.2
