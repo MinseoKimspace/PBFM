@@ -1,18 +1,18 @@
 # Config for data/generate_dataset.py
 dataset:
   output: data/relaxed_circles.pt
-  train_samples: 8192
-  val_samples: 2048
-  test_samples: 2048
+  train_samples: 131072
+  val_samples: 16384
+  test_samples: 16384
   num_objects: 8
   radius_min: 0.05
   radius_max: 0.15
   xy_limit: 1.0
 
 relax:
-  steps: 100
+  steps: 150
   lr: 0.05
-  batch_size: 512
+  batch_size: 4096
 
 physics:
   gravity_weight: 0.2
@@ -22,7 +22,7 @@ physics:
 
 runtime:
   seed: 42
-  device: auto
+  device: cuda
 
 render:
   enabled: false

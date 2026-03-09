@@ -4,11 +4,11 @@ eval:
   dataset: ""
   split: val
   use_init_state: false
-  batch_size: 256
-  num_workers: 0
+  batch_size: 4096
+  num_workers: 8
 
 runtime:
-  device: auto
+  device: cuda
 
 output:
   json: ""
