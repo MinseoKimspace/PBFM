@@ -1,0 +1,8 @@
+{
+  "python.defaultInterpreterPath": "C:\\Users\\alstj\\anaconda3\\envs\\pbfm\\python.exe",
+  "python.condaPath": "C:\\Users\\alstj\\anaconda3\\Scripts\\conda.exe",
+  "python.terminal.activateEnvironment": true,
+  "python.analysis.diagnosticMode": "workspace",
+  "python-envs.defaultEnvManager": "ms-python.python:conda",
+  "python-envs.defaultPackageManager": "ms-python.python:conda"
+}
