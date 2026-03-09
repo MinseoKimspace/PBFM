@@ -1,0 +1,48 @@
+{
+  "best_val_loss": 1.2627344131469727,
+  "history": [
+    {
+      "epoch": 1.0,
+      "train_loss": 1.3766944011052449,
+      "val_loss": 1.2627344131469727
+    }
+  ],
+  "model_kwargs": {
+    "hidden_dim": 128,
+    "time_dim": 64,
+    "num_layers": 3
+  },
+  "loss_kwargs": {
+    "gravity_weight": 0.2,
+    "ground_weight": 0.2,
+    "collision_weight": 0.2,
+    "y_ground": 0.0
+  },
+  "physics_weight": 0.1,
+  "train_args": {
+    "epochs": 1,
+    "batch_size": 32,
+    "lr": 0.001,
+    "weight_decay": 0.0001,
+    "grad_clip": 1.0,
+    "num_workers": 0,
+    "num_objects": 6,
+    "train_samples": 96,
+    "val_samples": 32,
+    "radius_min": 0.05,
+    "radius_max": 0.15,
+    "xy_limit": 1.0,
+    "hidden_dim": 128,
+    "time_dim": 64,
+    "num_layers": 3,
+    "physics_weight": 0.1,
+    "gravity_weight": 0.2,
+    "ground_weight": 0.2,
+    "collision_weight": 0.2,
+    "y_ground": 0.0,
+    "seed": 42,
+    "device": "auto",
+    "outdir": "runs",
+    "run_name": "smoke_transformer"
+  }
+}

@@ -13,7 +13,7 @@ class PhysicsEnergyLoss(nn.Module):
         self.collision_weight = collision_weight
         self.y_ground = y_ground
         
-    def forward(self, pos, radius): # pos = (B, N, 2), radius = (B, N)
+    def forward(self, pos: torch.Tensor, radius: torch.Tensor): # pos = (B, N, 2), radius = (B, N)
         gravity_loss = torch.mean(pos[:, :, 1])
         ground_loss = torch.mean(F.relu(radius[:,:] - pos[:, :, 1] + self.y_ground))
         pairwise_distances = pos[:, :, None, :] - pos[:, None, :, :]
