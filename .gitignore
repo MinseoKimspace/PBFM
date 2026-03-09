@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+runs/
+.tmp/
+
+data/renders*/
+data/*_smoke.pt
+data/relaxed_circles.pt
+
+*.npz

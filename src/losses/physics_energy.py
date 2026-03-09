@@ -18,6 +18,14 @@ class PhysicsEnergyLoss(nn.Module):
         ground_loss = torch.mean(F.relu(radius[:,:] - pos[:, :, 1] + self.y_ground))
         pairwise_distances = pos[:, :, None, :] - pos[:, None, :, :]
         pairwise_radius = radius[:, :,None] + radius[:, None, :]
-        collision_loss = F.softplus((pairwise_radius - torch.linalg.norm(pairwise_distances, dim=-1)).mean())
+        overlap = pairwise_radius - torch.linalg.norm(pairwise_distances, dim=-1)
+        collision_matrix = F.softplus(overlap)
+        num_objects = overlap.size(1)
+        upper_mask = torch.triu(
+            torch.ones(num_objects, num_objects, device=overlap.device, dtype=torch.bool),
+            diagonal=1,
+        ).unsqueeze(0).expand_as(collision_matrix)
+        collision_values = collision_matrix.masked_select(upper_mask)
+        collision_loss = collision_values.mean() if collision_values.numel() > 0 else collision_matrix.new_tensor(0.0)
         total_loss = (self.gravity_weight * gravity_loss + self.ground_weight * ground_loss + self.collision_weight * collision_loss)
         return total_loss

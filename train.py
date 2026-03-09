@@ -3,51 +3,93 @@ from __future__ import annotations
 import argparse
 import json
 import random
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
+import yaml
+from torch.utils.data import DataLoader
 
-from src.losses.physics_energy import PhysicsEnergyLoss
+from data.dataset import RelaxedCirclesDataset
+from src.losses.combined import CombinedLoss
 from src.models.network import FlowVelocityNet
-from src.paths.linear import sample_linear_path
+
+
+def _load_yaml_config(config_path: str) -> dict[str, Any]:
+    if not config_path:
+        return {}
+    path = Path(config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Config root must be a mapping, got {type(data)!r}")
+    return data
+
+
+def _get_nested(config: Mapping[str, Any], *keys: str, default: Any) -> Any:
+    cur: Any = config
+    for key in keys:
+        if not isinstance(cur, Mapping) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
 
 
 def parse_args() -> argparse.Namespace:
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", type=str, default="")
+    pre_args, remaining = pre.parse_known_args()
+    cfg = _load_yaml_config(pre_args.config)
+
     parser = argparse.ArgumentParser(description="Train flow model with FM + weighted physics residual.")
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--grad-clip", type=float, default=1.0)
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--config", type=str, default=pre_args.config)
 
-    parser.add_argument("--num-objects", type=int, default=8)
-    parser.add_argument("--train-samples", type=int, default=8192)
-    parser.add_argument("--val-samples", type=int, default=2048)
-    parser.add_argument("--radius-min", type=float, default=0.05)
-    parser.add_argument("--radius-max", type=float, default=0.15)
-    parser.add_argument("--xy-limit", type=float, default=1.0)
+    parser.add_argument("--dataset", type=str, default=_get_nested(cfg, "data", "dataset", default="data/relaxed_circles.pt"))
+    parser.add_argument("--train-split", type=str, default=_get_nested(cfg, "data", "train_split", default="train"))
+    parser.add_argument("--val-split", type=str, default=_get_nested(cfg, "data", "val_split", default="val"))
+    parser.add_argument(
+        "--use-init-state",
+        dest="use_init_state",
+        action="store_true",
+        default=bool(_get_nested(cfg, "data", "use_init_state", default=False)),
+    )
+    parser.add_argument("--use-relaxed-state", dest="use_init_state", action="store_false")
 
-    parser.add_argument("--hidden-dim", type=int, default=128)
-    parser.add_argument("--time-dim", type=int, default=64)
-    parser.add_argument("--num-layers", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=int(_get_nested(cfg, "train", "epochs", default=30)))
+    parser.add_argument("--batch-size", type=int, default=int(_get_nested(cfg, "train", "batch_size", default=128)))
+    parser.add_argument("--lr", type=float, default=float(_get_nested(cfg, "train", "lr", default=1e-3)))
+    parser.add_argument("--weight-decay", type=float, default=float(_get_nested(cfg, "train", "weight_decay", default=1e-4)))
+    parser.add_argument("--grad-clip", type=float, default=float(_get_nested(cfg, "train", "grad_clip", default=1.0)))
+    parser.add_argument("--num-workers", type=int, default=int(_get_nested(cfg, "train", "num_workers", default=0)))
 
-    parser.add_argument("--physics-weight", type=float, default=0.1)
-    parser.add_argument("--gravity-weight", type=float, default=0.2)
-    parser.add_argument("--ground-weight", type=float, default=0.2)
-    parser.add_argument("--collision-weight", type=float, default=0.2)
-    parser.add_argument("--y-ground", type=float, default=0.0)
+    parser.add_argument("--hidden-dim", type=int, default=int(_get_nested(cfg, "model", "hidden_dim", default=128)))
+    parser.add_argument("--time-dim", type=int, default=int(_get_nested(cfg, "model", "time_dim", default=64)))
+    parser.add_argument("--num-layers", type=int, default=int(_get_nested(cfg, "model", "num_layers", default=3)))
+    parser.add_argument("--num-heads", type=int, default=int(_get_nested(cfg, "model", "num_heads", default=8)))
+    parser.add_argument("--dropout", type=float, default=float(_get_nested(cfg, "model", "dropout", default=0.0)))
+    parser.add_argument("--ffn-mult", type=int, default=int(_get_nested(cfg, "model", "ffn_mult", default=4)))
 
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
-    parser.add_argument("--outdir", type=str, default="runs")
-    parser.add_argument("--run-name", type=str, default="")
-    return parser.parse_args()
+    parser.add_argument("--physics-weight", type=float, default=float(_get_nested(cfg, "loss", "physics_weight", default=0.1)))
+    parser.add_argument("--gravity-weight", type=float, default=float(_get_nested(cfg, "loss", "gravity_weight", default=0.2)))
+    parser.add_argument("--ground-weight", type=float, default=float(_get_nested(cfg, "loss", "ground_weight", default=0.2)))
+    parser.add_argument("--collision-weight", type=float, default=float(_get_nested(cfg, "loss", "collision_weight", default=0.2)))
+    parser.add_argument("--y-ground", type=float, default=float(_get_nested(cfg, "loss", "y_ground", default=0.0)))
+
+    parser.add_argument("--seed", type=int, default=int(_get_nested(cfg, "runtime", "seed", default=42)))
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=str(_get_nested(cfg, "runtime", "device", default="auto")),
+        choices=["auto", "cpu", "cuda"],
+    )
+    parser.add_argument("--outdir", type=str, default=str(_get_nested(cfg, "runtime", "outdir", default="runs")))
+    parser.add_argument("--run-name", type=str, default=str(_get_nested(cfg, "runtime", "run_name", default="")))
+    return parser.parse_args(remaining)
 
 
 def set_seed(seed: int) -> None:
@@ -68,60 +110,6 @@ def resolve_device(device_arg: str) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def make_synthetic_dataset(
-    num_samples: int,
-    num_objects: int,
-    radius_min: float,
-    radius_max: float,
-    xy_limit: float,
-    seed: int,
-) -> TensorDataset:
-    generator = torch.Generator().manual_seed(seed)
-
-    radius = torch.empty(num_samples, num_objects, dtype=torch.float32).uniform_(
-        radius_min, radius_max, generator=generator
-    )
-    x = torch.empty(num_samples, num_objects, dtype=torch.float32).uniform_(
-        -xy_limit, xy_limit, generator=generator
-    )
-    y_offset = torch.empty(num_samples, num_objects, dtype=torch.float32).uniform_(
-        0.0, xy_limit, generator=generator
-    )
-    y = radius + y_offset
-    state = torch.stack((x, y), dim=-1).contiguous()
-    return TensorDataset(state, radius.contiguous())
-
-
-def combined_loss(
-    model: torch.nn.Module,
-    physics_loss_fn: PhysicsEnergyLoss,
-    x1: torch.Tensor,
-    radius: torch.Tensor,
-    physics_weight: float,
-) -> Tuple[torch.Tensor, Dict[str, float]]:
-    _, x_t, t_now, target_v = sample_linear_path(x1)
-    t_start = torch.zeros_like(t_now)
-    v_hat = model(x_t, t_start, t_now)
-    fm_term = F.mse_loss(v_hat, target_v)
-
-    t_state = t_now
-    while t_state.dim() < x_t.dim():
-        t_state = t_state.unsqueeze(-1)
-    x1_hat = x_t + (1.0 - t_state) * v_hat
-
-    physics_term = physics_loss_fn(x1_hat, radius)
-    residual = physics_weight * physics_term
-    total = fm_term + residual
-
-    metrics = {
-        "loss": float(total.detach().item()),
-        "fm": float(fm_term.detach().item()),
-        "physics": float(physics_term.detach().item()),
-        "physics_residual": float(residual.detach().item()),
-    }
-    return total, metrics
-
-
 def mean_metrics(metrics: Iterable[Dict[str, float]]) -> Dict[str, float]:
     metrics = list(metrics)
     if not metrics:
@@ -136,10 +124,9 @@ def mean_metrics(metrics: Iterable[Dict[str, float]]) -> Dict[str, float]:
 
 def run_epoch(
     model: torch.nn.Module,
-    physics_loss_fn: PhysicsEnergyLoss,
+    criterion: CombinedLoss,
     loader: DataLoader,
     device: torch.device,
-    physics_weight: float,
     optimizer: torch.optim.Optimizer | None = None,
     grad_clip: float = 0.0,
 ) -> Dict[str, float]:
@@ -149,20 +136,14 @@ def run_epoch(
 
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
-        for state, radius in loader:
-            x1 = state.to(device)
-            r = radius.to(device)
+        for batch in loader:
+            x1 = batch["state"].to(device)
+            r = batch["radius"].to(device)
 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
 
-            loss, metrics = combined_loss(
-                model=model,
-                physics_loss_fn=physics_loss_fn,
-                x1=x1,
-                radius=r,
-                physics_weight=physics_weight,
-            )
+            loss, metrics = criterion(model, x1, r)
 
             if is_train:
                 loss.backward()
@@ -184,21 +165,16 @@ def main() -> None:
     run_dir = Path(args.outdir) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    train_ds = make_synthetic_dataset(
-        num_samples=args.train_samples,
-        num_objects=args.num_objects,
-        radius_min=args.radius_min,
-        radius_max=args.radius_max,
-        xy_limit=args.xy_limit,
-        seed=args.seed,
+    use_relaxed_state = not args.use_init_state
+    train_ds = RelaxedCirclesDataset(
+        dataset_path=args.dataset,
+        split=args.train_split,
+        use_relaxed_state=use_relaxed_state,
     )
-    val_ds = make_synthetic_dataset(
-        num_samples=args.val_samples,
-        num_objects=args.num_objects,
-        radius_min=args.radius_min,
-        radius_max=args.radius_max,
-        xy_limit=args.xy_limit,
-        seed=args.seed + 1,
+    val_ds = RelaxedCirclesDataset(
+        dataset_path=args.dataset,
+        split=args.val_split,
+        use_relaxed_state=use_relaxed_state,
     )
 
     train_loader = DataLoader(
@@ -222,8 +198,12 @@ def main() -> None:
         "hidden_dim": args.hidden_dim,
         "time_dim": args.time_dim,
         "num_layers": args.num_layers,
+        "num_heads": args.num_heads,
+        "dropout": args.dropout,
+        "ffn_mult": args.ffn_mult,
     }
     loss_kwargs = {
+        "physics_weight": args.physics_weight,
         "gravity_weight": args.gravity_weight,
         "ground_weight": args.ground_weight,
         "collision_weight": args.collision_weight,
@@ -231,29 +211,31 @@ def main() -> None:
     }
 
     model = FlowVelocityNet(**model_kwargs).to(device)
-    physics_loss_fn = PhysicsEnergyLoss(**loss_kwargs).to(device)
+    criterion = CombinedLoss(**loss_kwargs).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     best_val = float("inf")
     history: list[Dict[str, float]] = []
 
     print(f"Training on device={device}, run_dir={run_dir}")
+    print(
+        f"Dataset={args.dataset}, train_split={args.train_split}, val_split={args.val_split}, "
+        f"use_relaxed_state={use_relaxed_state}"
+    )
     for epoch in range(1, args.epochs + 1):
         train_metrics = run_epoch(
             model=model,
-            physics_loss_fn=physics_loss_fn,
+            criterion=criterion,
             loader=train_loader,
             device=device,
-            physics_weight=args.physics_weight,
             optimizer=optimizer,
             grad_clip=args.grad_clip,
         )
         val_metrics = run_epoch(
             model=model,
-            physics_loss_fn=physics_loss_fn,
+            criterion=criterion,
             loader=val_loader,
             device=device,
-            physics_weight=args.physics_weight,
             optimizer=None,
         )
 
@@ -267,7 +249,6 @@ def main() -> None:
             "optimizer_state_dict": optimizer.state_dict(),
             "model_kwargs": model_kwargs,
             "loss_kwargs": loss_kwargs,
-            "physics_weight": args.physics_weight,
             "train_args": vars(args),
             "train_metrics": train_metrics,
             "val_metrics": val_metrics,
@@ -291,7 +272,6 @@ def main() -> None:
                 "history": history,
                 "model_kwargs": model_kwargs,
                 "loss_kwargs": loss_kwargs,
-                "physics_weight": args.physics_weight,
                 "train_args": vars(args),
             },
             f,

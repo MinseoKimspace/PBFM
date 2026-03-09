@@ -1,0 +1,14 @@
+# Config for eval.py
+eval:
+  checkpoint: ""
+  dataset: ""
+  split: val
+  use_init_state: false
+  batch_size: 256
+  num_workers: 0
+
+runtime:
+  device: auto
+
+output:
+  json: ""

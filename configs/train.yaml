@@ -1,0 +1,35 @@
+# Config for train.py
+data:
+  dataset: data/relaxed_circles.pt
+  train_split: train
+  val_split: val
+  use_init_state: false
+
+train:
+  epochs: 30
+  batch_size: 128
+  lr: 0.001
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  num_workers: 0
+
+model:
+  hidden_dim: 128
+  time_dim: 64
+  num_layers: 3
+  num_heads: 8
+  dropout: 0.0
+  ffn_mult: 4
+
+loss:
+  physics_weight: 0.1
+  gravity_weight: 0.2
+  ground_weight: 0.2
+  collision_weight: 0.2
+  y_ground: 0.0
+
+runtime:
+  seed: 42
+  device: auto
+  outdir: runs
+  run_name: ""
