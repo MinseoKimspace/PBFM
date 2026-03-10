@@ -19,7 +19,7 @@ class PhysicsEnergyLoss(nn.Module):
         pairwise_distances = pos[:, :, None, :] - pos[:, None, :, :]
         pairwise_radius = radius[:, :,None] + radius[:, None, :]
         overlap = pairwise_radius - torch.linalg.norm(pairwise_distances, dim=-1)
-        collision_matrix = F.softplus(overlap)
+        collision_matrix = F.relu(overlap).pow(2)
         num_objects = overlap.size(1)
         upper_mask = torch.triu(
             torch.ones(num_objects, num_objects, device=overlap.device, dtype=torch.bool),

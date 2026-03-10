@@ -69,6 +69,18 @@ def parse_args() -> argparse.Namespace:
         default=bool(_get_nested(cfg, "relax", "hard_ground_projection", default=True)),
     )
     parser.add_argument("--no-hard-ground-projection", dest="hard_ground_projection", action="store_false")
+    parser.add_argument(
+        "--hard-collision-projection",
+        dest="hard_collision_projection",
+        action="store_true",
+        default=bool(_get_nested(cfg, "relax", "hard_collision_projection", default=False)),
+    )
+    parser.add_argument("--no-hard-collision-projection", dest="hard_collision_projection", action="store_false")
+    parser.add_argument(
+        "--collision-projection-iters",
+        type=int,
+        default=int(_get_nested(cfg, "relax", "collision_projection_iters", default=1)),
+    )
 
     parser.add_argument("--gravity-weight", type=float, default=float(_get_nested(cfg, "physics", "gravity_weight", default=0.2)))
     parser.add_argument("--ground-weight", type=float, default=float(_get_nested(cfg, "physics", "ground_weight", default=0.2)))
@@ -127,6 +139,48 @@ def make_random_batch(
     return state, radius.contiguous()
 
 
+def project_collisions_inplace(
+    state: torch.Tensor,
+    radius: torch.Tensor,
+    xy_limit: float,
+    ground_floor: torch.Tensor | None,
+    iterations: int,
+) -> None:
+    if iterations <= 0:
+        return
+    num_objects = int(state.size(1))
+    if num_objects < 2:
+        return
+
+    eps = 1e-8
+    for _ in range(iterations):
+        for i in range(num_objects - 1):
+            for j in range(i + 1, num_objects):
+                delta = state[:, i, :] - state[:, j, :]
+                dist = torch.linalg.norm(delta, dim=-1)
+                min_dist = radius[:, i] + radius[:, j]
+                overlap = (min_dist - dist).clamp_min(0.0)
+                if not torch.any(overlap > 0):
+                    continue
+
+                normal = delta / dist.clamp_min(eps).unsqueeze(-1)
+                degenerate = dist <= eps
+                if torch.any(degenerate):
+                    normal[degenerate, 0] = 1.0
+                    normal[degenerate, 1] = 0.0
+
+                corr = 0.5 * overlap.unsqueeze(-1) * normal
+                state[:, i, :] = state[:, i, :] + corr
+                state[:, j, :] = state[:, j, :] - corr
+
+        state[..., 0].clamp_(-xy_limit, xy_limit)
+        state[..., 1].clamp_max_(xy_limit)
+        if ground_floor is not None:
+            state[..., 1] = torch.maximum(state[..., 1], ground_floor)
+        else:
+            state[..., 1].clamp_min_(0.0)
+
+
 def relax_states(
     state_init: torch.Tensor,
     radius: torch.Tensor,
@@ -136,6 +190,8 @@ def relax_states(
     relax_lr: float,
     xy_limit: float,
     hard_ground_projection: bool,
+    hard_collision_projection: bool,
+    collision_projection_iters: int,
 ) -> torch.Tensor:
     if relax_steps <= 0:
         return state_init.clone()
@@ -164,6 +220,14 @@ def relax_states(
                 state[..., 1] = torch.maximum(state[..., 1], ground_floor)
             else:
                 state[..., 1].clamp_min_(0.0)
+            if hard_collision_projection:
+                project_collisions_inplace(
+                    state=state,
+                    radius=radius,
+                    xy_limit=xy_limit,
+                    ground_floor=ground_floor,
+                    iterations=collision_projection_iters,
+                )
     return state.detach().cpu()
 
 
@@ -202,6 +266,8 @@ def generate_split(
     physics_loss: PhysicsEnergyLoss,
     device: torch.device,
     hard_ground_projection: bool,
+    hard_collision_projection: bool,
+    collision_projection_iters: int,
 ) -> Dict[str, torch.Tensor]:
     state_init, radius = make_random_batch(
         num_samples=num_samples,
@@ -224,6 +290,8 @@ def generate_split(
             relax_lr=relax_lr,
             xy_limit=xy_limit,
             hard_ground_projection=hard_ground_projection,
+            hard_collision_projection=hard_collision_projection,
+            collision_projection_iters=collision_projection_iters,
         )
         relaxed_chunks.append(chunk)
     state_relaxed = torch.cat(relaxed_chunks, dim=0).contiguous()
@@ -344,6 +412,8 @@ def main() -> None:
         physics_loss=physics_loss,
         device=device,
         hard_ground_projection=args.hard_ground_projection,
+        hard_collision_projection=args.hard_collision_projection,
+        collision_projection_iters=args.collision_projection_iters,
     )
     val = generate_split(
         split_name="val",
@@ -359,6 +429,8 @@ def main() -> None:
         physics_loss=physics_loss,
         device=device,
         hard_ground_projection=args.hard_ground_projection,
+        hard_collision_projection=args.hard_collision_projection,
+        collision_projection_iters=args.collision_projection_iters,
     )
     test = generate_split(
         split_name="test",
@@ -374,6 +446,8 @@ def main() -> None:
         physics_loss=physics_loss,
         device=device,
         hard_ground_projection=args.hard_ground_projection,
+        hard_collision_projection=args.hard_collision_projection,
+        collision_projection_iters=args.collision_projection_iters,
     )
 
     payload = {
@@ -385,6 +459,8 @@ def main() -> None:
             "relax_steps": args.relax_steps,
             "relax_lr": args.relax_lr,
             "hard_ground_projection": args.hard_ground_projection,
+            "hard_collision_projection": args.hard_collision_projection,
+            "collision_projection_iters": args.collision_projection_iters,
             "gravity_weight": args.gravity_weight,
             "ground_weight": args.ground_weight,
             "collision_weight": args.collision_weight,

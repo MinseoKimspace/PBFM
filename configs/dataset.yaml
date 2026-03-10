@@ -14,6 +14,8 @@ relax:
   lr: 0.05
   batch_size: 4096
   hard_ground_projection: true
+  hard_collision_projection: false
+  collision_projection_iters: 1
 
 physics:
   gravity_weight: 0.2
