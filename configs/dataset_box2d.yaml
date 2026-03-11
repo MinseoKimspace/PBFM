@@ -1,0 +1,47 @@
+# Config for data/generate_box2d_dataset.py
+dataset:
+  output: data/box2d_circles.pt
+  train_samples: 131072
+  val_samples: 16384
+  test_samples: 16384
+  num_objects: 15
+  radius_min: 0.5
+  radius_max: 1.5
+
+layout:
+  xy_limit: 10.0
+  y_ground: 0.0
+  wall_thickness: 0.8
+  spawn_padding: 0.1
+  spawn_y_min_ratio: 0.35
+  spawn_y_max_ratio: 0.95
+  max_placement_tries: 128
+
+box2d:
+  gravity_y: -9.8
+  density: 1.0
+  friction: 0.4
+  restitution: 0.0
+  linear_damping: 0.1
+  angular_damping: 0.1
+  time_step: 0.0166666667
+  velocity_iters: 8
+  position_iters: 3
+  max_steps: 2400
+  min_steps_before_check: 300
+  sleep_window: 120
+  linear_velocity_eps: 0.02
+  angular_velocity_eps: 0.03
+
+runtime:
+  seed: 42
+  require_settled: true
+  max_resample_attempts: 8
+  support_check_eps: 0.02
+
+render:
+  enabled: true
+  dir: data/renders_box2d
+  split: train
+  count: 6
+  size: 1024
