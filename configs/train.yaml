@@ -22,7 +22,7 @@ model:
   ffn_mult: 4
 
 loss:
-  physics_weight: 0.1
+  physics_weight: 0.3
   gravity_weight: 0.2
   ground_weight: 0.2
   collision_weight: 0.2
