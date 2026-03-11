@@ -1,6 +1,6 @@
 # Config for train.py
 data:
-  dataset: data/relaxed_circles.pt
+  dataset: data/box2d_circles.pt
   train_split: train
   val_split: val
   use_init_state: false

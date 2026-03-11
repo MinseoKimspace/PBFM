@@ -18,19 +18,17 @@ COLOR_CYCLE = [
 ]
 
 
-def render_one(
+def render_state_image(
     state: torch.Tensor,
     radius: torch.Tensor,
-    output_path: Path,
     xy_limit: float,
     y_ground: float,
     image_size: int,
-) -> None:
+):
     try:
         from PIL import Image, ImageDraw
     except Exception:
-        print("PIL not available. Skipping render.")
-        return
+        return None
 
     world_x_min = -float(xy_limit)
     world_x_max = float(xy_limit)
@@ -69,6 +67,27 @@ def render_one(
         rr = float(radius[i]) * scale
         color = COLOR_CYCLE[i % len(COLOR_CYCLE)]
         draw.ellipse((cx - rr, cy - rr, cx + rr, cy + rr), outline=color, width=2)
+    return canvas
+
+
+def render_one(
+    state: torch.Tensor,
+    radius: torch.Tensor,
+    output_path: Path,
+    xy_limit: float,
+    y_ground: float,
+    image_size: int,
+) -> None:
+    canvas = render_state_image(
+        state=state,
+        radius=radius,
+        xy_limit=xy_limit,
+        y_ground=y_ground,
+        image_size=image_size,
+    )
+    if canvas is None:
+        print("PIL not available. Skipping render.")
+        return
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(output_path)

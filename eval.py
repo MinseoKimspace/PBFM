@@ -10,6 +10,11 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 
+try:
+    from data.box2d_render import render_state_image
+except ModuleNotFoundError:
+    from box2d_render import render_state_image
+
 from data.dataset import RelaxedCirclesDataset
 from src.losses.combined import CombinedLoss
 from src.models.network import FlowVelocityNet
@@ -114,47 +119,6 @@ def sample_flow_euler(model: torch.nn.Module, x0: torch.Tensor, steps: int) -> t
     return x
 
 
-def render_state(
-    state: torch.Tensor,
-    radius: torch.Tensor,
-    xy_limit: float,
-    image_size: int,
-):
-    from PIL import Image, ImageDraw
-
-    canvas = Image.new("RGB", (image_size, image_size), (255, 255, 255))
-    draw = ImageDraw.Draw(canvas)
-    color_cycle = [
-        (31, 119, 180),
-        (255, 127, 14),
-        (44, 160, 44),
-        (214, 39, 40),
-        (148, 103, 189),
-        (140, 86, 75),
-        (227, 119, 194),
-        (127, 127, 127),
-        (188, 189, 34),
-        (23, 190, 207),
-    ]
-
-    def to_px(x: float, y: float) -> tuple[float, float]:
-        x_px = (x + xy_limit) / (2.0 * xy_limit) * (image_size - 1)
-        y_px = (1.0 - (y / max(xy_limit, 1e-6))) * (image_size - 1)
-        return x_px, y_px
-
-    scale = (image_size - 1) / (2.0 * xy_limit)
-    ground_y = to_px(0.0, 0.0)[1]
-    draw.line([(0, ground_y), (image_size - 1, ground_y)], fill=(0, 0, 0), width=1)
-
-    for i in range(state.size(0)):
-        cx, cy = to_px(float(state[i, 0]), float(state[i, 1]))
-        rr = float(radius[i]) * scale
-        color = color_cycle[i % len(color_cycle)]
-        draw.ellipse((cx - rr, cy - rr, cx + rr, cy + rr), outline=color, width=2)
-
-    return canvas
-
-
 def render_model_samples(
     model: torch.nn.Module,
     dataset: RelaxedCirclesDataset,
@@ -166,7 +130,7 @@ def render_model_samples(
     render_seed: int,
 ) -> None:
     try:
-        from PIL import Image
+        from PIL import Image, ImageDraw, ImageFont
     except Exception:
         print("PIL not available. Skipping render.")
         return
@@ -174,6 +138,8 @@ def render_model_samples(
     out_dir = Path(render_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     xy_limit = float(dataset.meta.get("xy_limit", 1.0))
+    y_ground = float(dataset.meta.get("y_ground", 0.0))
+    y_top = y_ground + xy_limit
     count = min(render_count, len(dataset))
     g = torch.Generator(device="cpu").manual_seed(render_seed)
 
@@ -185,16 +151,44 @@ def render_model_samples(
             x0 = torch.randn(x1.shape, generator=g, dtype=x1.dtype, device="cpu").to(device)
             x_hat = sample_flow_euler(model, x0, steps=sample_steps)
             x_hat[..., 0].clamp_(-xy_limit, xy_limit)
-            x_hat[..., 1].clamp_(0.0, xy_limit)
+            x_hat[..., 1].clamp_(y_ground, y_top)
 
-            img_x0 = render_state(x0[0].cpu(), radius[0].cpu(), xy_limit=xy_limit, image_size=render_size)
-            img_pred = render_state(x_hat[0].cpu(), radius[0].cpu(), xy_limit=xy_limit, image_size=render_size)
-            img_target = render_state(x1[0].cpu(), radius[0].cpu(), xy_limit=xy_limit, image_size=render_size)
+            img_x0 = render_state_image(
+                x0[0].cpu(), radius[0].cpu(), xy_limit=xy_limit, y_ground=y_ground, image_size=render_size
+            )
+            img_pred = render_state_image(
+                x_hat[0].cpu(), radius[0].cpu(), xy_limit=xy_limit, y_ground=y_ground, image_size=render_size
+            )
+            img_target = render_state_image(
+                x1[0].cpu(), radius[0].cpu(), xy_limit=xy_limit, y_ground=y_ground, image_size=render_size
+            )
+            if img_x0 is None or img_pred is None or img_target is None:
+                print("PIL not available. Skipping render.")
+                return
 
-            canvas = Image.new("RGB", (render_size * 3, render_size), (255, 255, 255))
-            canvas.paste(img_x0, (0, 0))
-            canvas.paste(img_pred, (render_size, 0))
-            canvas.paste(img_target, (render_size * 2, 0))
+            panel_w, panel_h = img_x0.size
+            caption_h = 36
+            canvas = Image.new("RGB", (panel_w * 3, panel_h + caption_h), (255, 255, 255))
+            canvas.paste(img_x0, (0, caption_h))
+            canvas.paste(img_pred, (panel_w, caption_h))
+            canvas.paste(img_target, (panel_w * 2, caption_h))
+
+            draw = ImageDraw.Draw(canvas)
+            try:
+                font = ImageFont.truetype("arial.ttf", 20)
+            except Exception:
+                font = ImageFont.load_default()
+            labels = ("x0", "pred", "target")
+            for col, label in enumerate(labels):
+                x_left = col * panel_w
+                x_center = x_left + panel_w * 0.5
+                bbox = draw.textbbox((0, 0), label, font=font)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+                x_text = int(round(x_center - text_w * 0.5))
+                y_text = int(round((caption_h - text_h) * 0.5))
+                draw.text((x_text, y_text), label, fill=(0, 0, 0), font=font)
+
             canvas.save(out_dir / f"{idx:04d}_x0_pred_target.png")
 
     print(f"Saved model renders to {out_dir}")
