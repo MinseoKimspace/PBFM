@@ -65,6 +65,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=int(_get_nested(cfg, "eval", "batch_size", default=256)))
     parser.add_argument("--num-workers", type=int, default=int(_get_nested(cfg, "eval", "num_workers", default=0)))
     parser.add_argument(
+        "--physics-weight-min",
+        type=float,
+        default=float(_get_nested(cfg, "loss", "physics_weight_min", default=0.05)),
+    )
+    parser.add_argument(
+        "--physics-weight-max",
+        type=float,
+        default=float(_get_nested(cfg, "loss", "physics_weight_max", default=2.0)),
+    )
+    parser.add_argument(
+        "--physics-weight-eps",
+        type=float,
+        default=float(_get_nested(cfg, "loss", "physics_weight_eps", default=1e-8)),
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=str(_get_nested(cfg, "runtime", "device", default="auto")),
@@ -218,6 +233,9 @@ def main() -> None:
         "loss_kwargs",
         {
             "physics_weight": float(checkpoint.get("physics_weight", train_args.get("physics_weight", 0.1))),
+            "physics_weight_min": float(train_args.get("physics_weight_min", args.physics_weight_min)),
+            "physics_weight_max": float(train_args.get("physics_weight_max", args.physics_weight_max)),
+            "physics_weight_eps": float(train_args.get("physics_weight_eps", args.physics_weight_eps)),
             "gravity_weight": 0.2,
             "ground_weight": 0.2,
             "collision_weight": 0.2,
@@ -226,6 +244,12 @@ def main() -> None:
     )
     if "physics_weight" not in loss_kwargs:
         loss_kwargs["physics_weight"] = float(checkpoint.get("physics_weight", train_args.get("physics_weight", 0.1)))
+    if "physics_weight_min" not in loss_kwargs:
+        loss_kwargs["physics_weight_min"] = float(train_args.get("physics_weight_min", args.physics_weight_min))
+    if "physics_weight_max" not in loss_kwargs:
+        loss_kwargs["physics_weight_max"] = float(train_args.get("physics_weight_max", args.physics_weight_max))
+    if "physics_weight_eps" not in loss_kwargs:
+        loss_kwargs["physics_weight_eps"] = float(train_args.get("physics_weight_eps", args.physics_weight_eps))
 
     dataset_path = args.dataset if args.dataset else str(train_args.get("dataset", ""))
     if not dataset_path:

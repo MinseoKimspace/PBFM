@@ -7,6 +7,11 @@ eval:
   batch_size: 4096
   num_workers: 8
 
+loss:
+  physics_weight_min: 0.05
+  physics_weight_max: 2.0
+  physics_weight_eps: 1.0e-8
+
 runtime:
   device: cuda
 

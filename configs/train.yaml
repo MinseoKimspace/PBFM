@@ -23,6 +23,9 @@ model:
 
 loss:
   physics_weight: 0.3
+  physics_weight_min: 0.05
+  physics_weight_max: 2.0
+  physics_weight_eps: 1.0e-8
   gravity_weight: 0.2
   ground_weight: 0.2
   collision_weight: 0.2
