@@ -46,10 +46,13 @@ class CombinedLoss(nn.Module):
         fm_term = F.mse_loss(v_hat, target_v)
         x1_hat = x_t + (1.0 - t_now).unsqueeze(-1) * v_hat
         physics_term = self.physics(x1_hat, radius)
+        fm_detached = fm_term.detach()
+        physics_detached = physics_term.detach()
+        fm_over_physics = fm_detached / (physics_detached + self.physics_weight_eps)
 
         # Dynamic balance: keep physics term from being drowned out by FM scale.
         physics_weight_eff = self.physics_weight * (
-            fm_term.detach() / (physics_term.detach() + self.physics_weight_eps)
+            fm_over_physics
         )
         physics_weight_eff = torch.clamp(
             physics_weight_eff,
@@ -58,16 +61,19 @@ class CombinedLoss(nn.Module):
         )
         residual = physics_weight_eff * physics_term
         total = fm_term + residual
+        residual_over_fm = residual.detach() / (fm_detached + self.physics_weight_eps)
         fm_metrics = {
-            "loss": float(fm_term.detach().item()),
-            "v_mse": float(fm_term.detach().item()),
+            "loss": float(fm_detached.item()),
+            "v_mse": float(fm_detached.item()),
         }
 
         metrics = {
             "loss": float(total.detach().item()),
-            "fm": float(fm_term.detach().item()),
-            "physics": float(physics_term.detach().item()),
+            "fm": float(fm_detached.item()),
+            "physics": float(physics_detached.item()),
+            "fm_over_physics": float(fm_over_physics.item()),
             "physics_residual": float(residual.detach().item()),
+            "physics_residual_over_fm": float(residual_over_fm.item()),
             "physics_weight_eff": float(physics_weight_eff.detach().item()),
         }
         metrics.update({f"fm_{k}": v for k, v in fm_metrics.items()})

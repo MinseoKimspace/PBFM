@@ -288,7 +288,10 @@ def main() -> None:
             f"[{epoch:03d}/{args.epochs:03d}] "
             f"train_loss={train_loss:.6f} val_loss={val_loss:.6f} "
             f"fm={val_metrics.get('fm', float('nan')):.6f} "
-            f"physics={val_metrics.get('physics', float('nan')):.6f}"
+            f"physics={val_metrics.get('physics', float('nan')):.6f} "
+            f"fm/physics={val_metrics.get('fm_over_physics', float('nan')):.6f} "
+            f"w_eff={val_metrics.get('physics_weight_eff', float('nan')):.6f} "
+            f"res/fm={val_metrics.get('physics_residual_over_fm', float('nan')):.6f}"
         )
 
     with (run_dir / "summary.json").open("w", encoding="utf-8") as f:
