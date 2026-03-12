@@ -15,6 +15,7 @@ class FlowVelocityNet(nn.Module):
         num_heads: int = 8,
         dropout: float = 0.0,
         ffn_mult: int = 4,
+        use_radius_condition: bool = False,
     ) -> None:
         super().__init__()
         if num_layers < 1:
@@ -28,8 +29,9 @@ class FlowVelocityNet(nn.Module):
         if ffn_mult < 1:
             raise ValueError(f"ffn_mult must be >= 1, got {ffn_mult}")
 
+        self.use_radius_condition = use_radius_condition
         self.time_embed = TimeEmbeddingMLP(time_dim)
-        in_dim = 2 + 2 + 3 * time_dim
+        in_dim = 2 + 2 + 3 * time_dim + (1 if use_radius_condition else 0)
 
         self.input_proj = nn.Linear(in_dim, hidden_dim)
         encoder_layer = nn.TransformerEncoderLayer(
@@ -49,7 +51,13 @@ class FlowVelocityNet(nn.Module):
             nn.Linear(hidden_dim, 2),
         )
 
-    def forward(self, x: torch.Tensor, t_start: torch.Tensor, t_end: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        t_start: torch.Tensor,
+        t_end: torch.Tensor,
+        radius: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if x.dim() != 3 or x.size(-1) != 2:
             raise ValueError(f"Expected x shape (B, N, 2), got {tuple(x.shape)}")
         if t_start.dim() != 2 or t_start.size(1) != 1:
@@ -60,6 +68,15 @@ class FlowVelocityNet(nn.Module):
             raise ValueError(
                 f"Batch dimension mismatch between x/t_start/t_end: {tuple(x.shape)}, {tuple(t_start.shape)}, {tuple(t_end.shape)}"
             )
+        if self.use_radius_condition:
+            if radius is None:
+                raise ValueError("radius is required when use_radius_condition=True")
+            if radius.dim() != 2:
+                raise ValueError(f"Expected radius shape (B, N), got {tuple(radius.shape)}")
+            if radius.shape[0] != x.shape[0] or radius.shape[1] != x.shape[1]:
+                raise ValueError(
+                    f"Batch/object mismatch between x and radius: {tuple(x.shape)} vs {tuple(radius.shape)}"
+                )
 
         batch_size, num_objects, _ = x.shape
         global_mean = x.mean(dim=1, keepdim=True).expand(batch_size, num_objects, 2)
@@ -69,7 +86,10 @@ class FlowVelocityNet(nn.Module):
         t1_emb = self.time_embed(t_end).unsqueeze(1).expand(batch_size, num_objects, -1)
         td_emb = self.time_embed(t_delta).unsqueeze(1).expand(batch_size, num_objects, -1)
 
-        features = torch.cat([x, global_mean, t0_emb, t1_emb, td_emb], dim=-1)
-        tokens = self.input_proj(features)
+        features = [x, global_mean, t0_emb, t1_emb, td_emb]
+        if self.use_radius_condition:
+            features.append(radius.unsqueeze(-1))
+        features_cat = torch.cat(features, dim=-1)
+        tokens = self.input_proj(features_cat)
         encoded = self.encoder(tokens)
         return self.head(encoded)

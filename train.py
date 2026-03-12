@@ -73,6 +73,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-heads", type=int, default=int(_get_nested(cfg, "model", "num_heads", default=8)))
     parser.add_argument("--dropout", type=float, default=float(_get_nested(cfg, "model", "dropout", default=0.0)))
     parser.add_argument("--ffn-mult", type=int, default=int(_get_nested(cfg, "model", "ffn_mult", default=4)))
+    parser.add_argument(
+        "--use-radius-condition",
+        dest="use_radius_condition",
+        action="store_true",
+        default=bool(_get_nested(cfg, "model", "use_radius_condition", default=False)),
+    )
+    parser.add_argument("--no-radius-condition", dest="use_radius_condition", action="store_false")
 
     parser.add_argument("--physics-weight", type=float, default=float(_get_nested(cfg, "loss", "physics_weight", default=0.1)))
     parser.add_argument(
@@ -216,6 +223,7 @@ def main() -> None:
         "num_heads": args.num_heads,
         "dropout": args.dropout,
         "ffn_mult": args.ffn_mult,
+        "use_radius_condition": args.use_radius_condition,
     }
     loss_kwargs = {
         "physics_weight": args.physics_weight,

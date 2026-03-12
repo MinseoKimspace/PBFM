@@ -42,7 +42,7 @@ class CombinedLoss(nn.Module):
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         _, x_t, t_now, target_v = sample_linear_path(x1)
         t_start = torch.zeros_like(t_now)
-        v_hat = model(x_t, t_start, t_now)
+        v_hat = model(x_t, t_start, t_now, radius=radius)
         fm_term = F.mse_loss(v_hat, target_v)
         x1_hat = x_t + (1.0 - t_now).unsqueeze(-1) * v_hat
         physics_term = self.physics(x1_hat, radius)

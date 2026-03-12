@@ -116,7 +116,12 @@ def mean_metrics(metrics: Iterable[Dict[str, float]]) -> Dict[str, float]:
     return {key: value / n for key, value in sums.items()}
 
 
-def sample_flow_euler(model: torch.nn.Module, x0: torch.Tensor, steps: int) -> torch.Tensor:
+def sample_flow_euler(
+    model: torch.nn.Module,
+    x0: torch.Tensor,
+    radius: torch.Tensor,
+    steps: int,
+) -> torch.Tensor:
     if steps < 1:
         raise ValueError(f"sample steps must be >= 1, got {steps}")
     x = x0
@@ -129,7 +134,7 @@ def sample_flow_euler(model: torch.nn.Module, x0: torch.Tensor, steps: int) -> t
             dtype=x.dtype,
         )
         t_start = torch.zeros_like(t_now)
-        v_hat = model(x, t_start, t_now)
+        v_hat = model(x, t_start, t_now, radius=radius)
         x = x + dt * v_hat
     return x
 
@@ -164,7 +169,7 @@ def render_model_samples(
             x1 = item["state"].unsqueeze(0).to(device)
             radius = item["radius"].unsqueeze(0).to(device)
             x0 = torch.randn(x1.shape, generator=g, dtype=x1.dtype, device="cpu").to(device)
-            x_hat = sample_flow_euler(model, x0, steps=sample_steps)
+            x_hat = sample_flow_euler(model, x0, radius=radius, steps=sample_steps)
             x_hat[..., 0].clamp_(-xy_limit, xy_limit)
             x_hat[..., 1].clamp_(y_ground, y_top)
 
@@ -227,6 +232,7 @@ def main() -> None:
             "num_heads": 8,
             "dropout": 0.0,
             "ffn_mult": 4,
+            "use_radius_condition": False,
         },
     )
     loss_kwargs = checkpoint.get(

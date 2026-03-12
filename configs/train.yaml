@@ -6,9 +6,9 @@ data:
   use_init_state: false
 
 train:
-  epochs: 80
-  batch_size: 1024
-  lr: 0.0005
+  epochs: 300
+  batch_size: 256
+  lr: 0.0006
   weight_decay: 0.0001
   grad_clip: 1.0
   num_workers: 8
@@ -20,15 +20,16 @@ model:
   num_heads: 8
   dropout: 0.05
   ffn_mult: 4
+  use_radius_condition: true
 
 loss:
-  physics_weight: 0.3
+  physics_weight: 0.5
   physics_weight_min: 0.05
   physics_weight_max: 2.0
   physics_weight_eps: 1.0e-8
   gravity_weight: 0.2
-  ground_weight: 0.2
-  collision_weight: 0.2
+  ground_weight: 0.4
+  collision_weight: 0.4
   y_ground: 0.0
 
 runtime:
