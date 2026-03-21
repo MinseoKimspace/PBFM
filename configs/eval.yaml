@@ -23,3 +23,4 @@ render:
   size: 1024
   sample_steps: 64
   seed: 1234
+  trajectory: true

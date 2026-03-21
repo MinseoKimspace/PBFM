@@ -83,6 +83,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--render-size", type=int, default=int(_get_nested(cfg, "render", "size", default=1024)))
     parser.add_argument("--sample-steps", type=int, default=int(_get_nested(cfg, "render", "sample_steps", default=64)))
     parser.add_argument("--render-seed", type=int, default=int(_get_nested(cfg, "render", "seed", default=1234)))
+    parser.add_argument(
+        "--render-trajectory",
+        action=argparse.BooleanOptionalAction,
+        default=bool(_get_nested(cfg, "render", "trajectory", default=True)),
+    )
     return parser.parse_args(remaining)
 
 
@@ -113,10 +118,12 @@ def sample_flow_euler(
     x0: torch.Tensor,
     radius: torch.Tensor,
     steps: int,
-) -> torch.Tensor:
+    return_trajectory: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
     if steps < 1:
         raise ValueError(f"sample steps must be >= 1, got {steps}")
     x = x0
+    trajectory = [x.detach().clone()] if return_trajectory else None
     dt = 1.0 / float(steps)
     for i in range(steps):
         t_now = torch.full(
@@ -128,7 +135,23 @@ def sample_flow_euler(
         t_start = torch.zeros_like(t_now)
         v_hat = model(x, t_start, t_now, radius=radius)
         x = x + dt * v_hat
+        if trajectory is not None:
+            trajectory.append(x.detach().clone())
+    if trajectory is not None:
+        return x, trajectory
     return x
+
+
+def clamp_state_for_render(
+    state: torch.Tensor,
+    xy_limit: float,
+    y_ground: float,
+) -> torch.Tensor:
+    y_top = y_ground + xy_limit
+    state_render = state.detach().clone()
+    state_render[..., 0].clamp_(-xy_limit, xy_limit)
+    state_render[..., 1].clamp_(y_ground, y_top)
+    return state_render
 
 
 def render_model_samples(
@@ -140,6 +163,7 @@ def render_model_samples(
     render_size: int,
     sample_steps: int,
     render_seed: int,
+    render_trajectory: bool,
 ) -> None:
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -151,9 +175,7 @@ def render_model_samples(
     out_dir.mkdir(parents=True, exist_ok=True)
     xy_limit = float(dataset.meta.get("xy_limit", 1.0))
     y_ground = float(dataset.meta.get("y_ground", 0.0))
-    y_top = y_ground + xy_limit
     count = min(render_count, len(dataset))
-    g = torch.Generator(device="cpu").manual_seed(render_seed)
 
     with torch.no_grad():
         for idx in range(count):
@@ -161,18 +183,31 @@ def render_model_samples(
             x1 = item["state"].unsqueeze(0).to(device)
             radius = item["radius"].unsqueeze(0).to(device)
             x0 = item["state_init"].unsqueeze(0).to(device)
-            x_hat = sample_flow_euler(model, x0, radius=radius, steps=sample_steps)
-            x_hat[..., 0].clamp_(-xy_limit, xy_limit)
-            x_hat[..., 1].clamp_(y_ground, y_top)
+            sample_out = sample_flow_euler(
+                model,
+                x0,
+                radius=radius,
+                steps=sample_steps,
+                return_trajectory=render_trajectory,
+            )
+            if render_trajectory:
+                x_hat, trajectory = sample_out
+            else:
+                x_hat = sample_out
+                trajectory = None
+
+            x0_render = clamp_state_for_render(x0[0], xy_limit=xy_limit, y_ground=y_ground)
+            x_hat_render = clamp_state_for_render(x_hat[0], xy_limit=xy_limit, y_ground=y_ground)
+            x1_render = clamp_state_for_render(x1[0], xy_limit=xy_limit, y_ground=y_ground)
 
             img_x0 = render_state_image(
-                x0[0].cpu(), radius[0].cpu(), xy_limit=xy_limit, y_ground=y_ground, image_size=render_size
+                x0_render.cpu(), radius[0].cpu(), xy_limit=xy_limit, y_ground=y_ground, image_size=render_size
             )
             img_pred = render_state_image(
-                x_hat[0].cpu(), radius[0].cpu(), xy_limit=xy_limit, y_ground=y_ground, image_size=render_size
+                x_hat_render.cpu(), radius[0].cpu(), xy_limit=xy_limit, y_ground=y_ground, image_size=render_size
             )
             img_target = render_state_image(
-                x1[0].cpu(), radius[0].cpu(), xy_limit=xy_limit, y_ground=y_ground, image_size=render_size
+                x1_render.cpu(), radius[0].cpu(), xy_limit=xy_limit, y_ground=y_ground, image_size=render_size
             )
             if img_x0 is None or img_pred is None or img_target is None:
                 print("PIL not available. Skipping render.")
@@ -202,6 +237,23 @@ def render_model_samples(
                 draw.text((x_text, y_text), label, fill=(0, 0, 0), font=font)
 
             canvas.save(out_dir / f"{idx:04d}_x0_pred_target.png")
+
+            if trajectory is not None:
+                traj_dir = out_dir / f"{idx:04d}_trajectory"
+                traj_dir.mkdir(parents=True, exist_ok=True)
+                for step_idx, state_step in enumerate(trajectory):
+                    state_render = clamp_state_for_render(state_step[0], xy_limit=xy_limit, y_ground=y_ground)
+                    img_step = render_state_image(
+                        state_render.cpu(),
+                        radius[0].cpu(),
+                        xy_limit=xy_limit,
+                        y_ground=y_ground,
+                        image_size=render_size,
+                    )
+                    if img_step is None:
+                        print("PIL not available. Skipping render.")
+                        return
+                    img_step.save(traj_dir / f"step_{step_idx:03d}.png")
 
     print(f"Saved model renders to {out_dir}")
 
@@ -311,6 +363,7 @@ def main() -> None:
             render_size=args.render_size,
             sample_steps=args.sample_steps,
             render_seed=args.render_seed,
+            render_trajectory=args.render_trajectory,
         )
 
 
