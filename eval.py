@@ -54,14 +54,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=str, default=str(_get_nested(cfg, "eval", "checkpoint", default="")))
     parser.add_argument("--dataset", type=str, default=str(_get_nested(cfg, "eval", "dataset", default="")))
     parser.add_argument("--split", type=str, default=str(_get_nested(cfg, "eval", "split", default="val")))
-    parser.add_argument(
-        "--use-init-state",
-        dest="use_init_state",
-        action="store_true",
-        default=bool(_get_nested(cfg, "eval", "use_init_state", default=False)),
-    )
-    parser.add_argument("--use-relaxed-state", dest="use_init_state", action="store_false")
-
     parser.add_argument("--batch-size", type=int, default=int(_get_nested(cfg, "eval", "batch_size", default=256)))
     parser.add_argument("--num-workers", type=int, default=int(_get_nested(cfg, "eval", "num_workers", default=0)))
     parser.add_argument(
@@ -168,7 +160,7 @@ def render_model_samples(
             item = dataset[idx]
             x1 = item["state"].unsqueeze(0).to(device)
             radius = item["radius"].unsqueeze(0).to(device)
-            x0 = torch.randn(x1.shape, generator=g, dtype=x1.dtype, device="cpu").to(device)
+            x0 = item["state_init"].unsqueeze(0).to(device)
             x_hat = sample_flow_euler(model, x0, radius=radius, steps=sample_steps)
             x_hat[..., 0].clamp_(-xy_limit, xy_limit)
             x_hat[..., 1].clamp_(y_ground, y_top)
@@ -262,13 +254,12 @@ def main() -> None:
         raise ValueError("Dataset path is required. Pass --dataset or use a checkpoint saved from dataset-based training.")
 
     split = args.split if args.split else str(train_args.get("val_split", "val"))
-    use_init_state = args.use_init_state or bool(train_args.get("use_init_state", False))
-    use_relaxed_state = not use_init_state
 
     dataset = RelaxedCirclesDataset(
         dataset_path=dataset_path,
         split=split,
-        use_relaxed_state=use_relaxed_state,
+        use_relaxed_state=True,
+        return_init_state=True,
     )
     loader = DataLoader(
         dataset,
@@ -288,15 +279,16 @@ def main() -> None:
     with torch.no_grad():
         for batch in loader:
             x1 = batch["state"].to(device)
+            x0 = batch["state_init"].to(device)
             r = batch["radius"].to(device)
-            _, metrics = criterion(model, x1, r)
+            _, metrics = criterion(model, x0, x1, r)
             rows.append(metrics)
 
     report = {
         "checkpoint": str(checkpoint_path),
         "dataset": str(dataset_path),
         "split": split,
-        "use_relaxed_state": use_relaxed_state,
+        "path": "state_init->state_relaxed",
         "device": str(device),
         "num_batches": len(rows),
         "metrics": mean_metrics(rows),

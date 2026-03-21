@@ -3,7 +3,6 @@ eval:
   checkpoint: ""
   dataset: ""
   split: val
-  use_init_state: false
   batch_size: 4096
   num_workers: 8
 

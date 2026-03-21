@@ -4,9 +4,9 @@ import torch
 
 
 def sample_linear_path(
+    x0: torch.Tensor,    
     x1: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    x0 = torch.randn_like(x1)
     t = torch.rand(x1.size(0), 1, device=x1.device, dtype=x1.dtype)
     t_state = t.unsqueeze(-1)
     x_t = (1.0 - t_state) * x0 + t_state * x1

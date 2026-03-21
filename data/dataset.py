@@ -36,6 +36,11 @@ class RelaxedCirclesDataset(Dataset):
         self.meta = payload.get("meta", {})
         self.split = split
 
+        if self.return_init_state and self.state_init is None:
+            raise KeyError(f"Key 'state_init' not found in split '{split}'.")
+        if self.state_init is not None:
+            self.state_init = self.state_init.float().contiguous()
+
         if self.state.dim() != 3 or self.state.size(-1) != 2:
             raise ValueError(f"Expected state shape (S, N, 2), got {tuple(self.state.shape)}")
         if self.radius.dim() != 2:
@@ -43,6 +48,10 @@ class RelaxedCirclesDataset(Dataset):
         if self.state.shape[:2] != self.radius.shape:
             raise ValueError(
                 f"State/radius leading shape mismatch: {tuple(self.state.shape)} vs {tuple(self.radius.shape)}"
+            )
+        if self.state_init is not None and self.state_init.shape != self.state.shape:
+            raise ValueError(
+                f"state_init/state shape mismatch: {tuple(self.state_init.shape)} vs {tuple(self.state.shape)}"
             )
 
     def __len__(self) -> int:

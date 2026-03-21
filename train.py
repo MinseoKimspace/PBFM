@@ -52,14 +52,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", type=str, default=_get_nested(cfg, "data", "dataset", default="data/relaxed_circles.pt"))
     parser.add_argument("--train-split", type=str, default=_get_nested(cfg, "data", "train_split", default="train"))
     parser.add_argument("--val-split", type=str, default=_get_nested(cfg, "data", "val_split", default="val"))
-    parser.add_argument(
-        "--use-init-state",
-        dest="use_init_state",
-        action="store_true",
-        default=bool(_get_nested(cfg, "data", "use_init_state", default=False)),
-    )
-    parser.add_argument("--use-relaxed-state", dest="use_init_state", action="store_false")
-
     parser.add_argument("--epochs", type=int, default=int(_get_nested(cfg, "train", "epochs", default=30)))
     parser.add_argument("--batch-size", type=int, default=int(_get_nested(cfg, "train", "batch_size", default=128)))
     parser.add_argument("--lr", type=float, default=float(_get_nested(cfg, "train", "lr", default=1e-3)))
@@ -161,11 +153,12 @@ def run_epoch(
         for batch in loader:
             x1 = batch["state"].to(device)
             r = batch["radius"].to(device)
+            x0 = batch["state_init"].to(device)
 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
 
-            loss, metrics = criterion(model, x1, r)
+            loss, metrics = criterion(model, x0, x1, r)
 
             if is_train:
                 loss.backward()
@@ -187,16 +180,17 @@ def main() -> None:
     run_dir = Path(args.outdir) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    use_relaxed_state = not args.use_init_state
     train_ds = RelaxedCirclesDataset(
         dataset_path=args.dataset,
         split=args.train_split,
-        use_relaxed_state=use_relaxed_state,
+        use_relaxed_state=True,
+        return_init_state=True,
     )
     val_ds = RelaxedCirclesDataset(
         dataset_path=args.dataset,
         split=args.val_split,
-        use_relaxed_state=use_relaxed_state,
+        use_relaxed_state=True,
+        return_init_state=True,
     )
 
     train_loader = DataLoader(
@@ -246,7 +240,7 @@ def main() -> None:
     print(f"Training on device={device}, run_dir={run_dir}")
     print(
         f"Dataset={args.dataset}, train_split={args.train_split}, val_split={args.val_split}, "
-        f"use_relaxed_state={use_relaxed_state}"
+        "path=state_init->state_relaxed"
     )
     for epoch in range(1, args.epochs + 1):
         train_metrics = run_epoch(

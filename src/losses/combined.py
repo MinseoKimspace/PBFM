@@ -37,10 +37,11 @@ class CombinedLoss(nn.Module):
     def forward(
         self,
         model: torch.nn.Module,
+        x0: torch.Tensor,
         x1: torch.Tensor, # (B,N,2)
         radius: torch.Tensor, # (B,N)
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        _, x_t, t_now, target_v = sample_linear_path(x1)
+        _, x_t, t_now, target_v = sample_linear_path(x0, x1)
         t_start = torch.zeros_like(t_now)
         v_hat = model(x_t, t_start, t_now, radius=radius)
         fm_term = F.mse_loss(v_hat, target_v)
