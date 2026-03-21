@@ -12,10 +12,10 @@ layout:
   xy_limit: 10.0
   y_ground: 0.0
   wall_thickness: 0.8
-  spawn_padding: 0.1
-  spawn_y_min_ratio: 0.35
-  spawn_y_max_ratio: 0.95
-  max_placement_tries: 128
+  spawn_padding: 0.02
+  spawn_y_min_ratio: 0.2
+  spawn_y_max_ratio: 0.98
+  max_placement_tries: 512
 
 box2d:
   gravity_y: -9.8
@@ -36,7 +36,7 @@ box2d:
 runtime:
   seed: 42
   require_settled: true
-  max_resample_attempts: 8
+  max_resample_attempts: 32
   support_check_eps: 0.02
 
 render:

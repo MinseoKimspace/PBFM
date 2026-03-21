@@ -212,17 +212,16 @@ def _sample_spawn_points(
 ) -> list[tuple[float, float]]:
     placements: list[tuple[float, float] | None] = [None] * num_objects
     placed_indices: list[int] = []
-    r_max = float(radius.max().item())
-    x_min = -xy_limit + r_max + spawn_padding
-    x_max = xy_limit - r_max - spawn_padding
-    y_min = y_ground + max(spawn_y_min_ratio * xy_limit, r_max + spawn_padding)
-    y_max = y_ground + min(spawn_y_max_ratio * xy_limit, xy_limit - r_max - spawn_padding)
-    if x_min >= x_max or y_min >= y_max:
-        raise ValueError("Spawn area is invalid. Adjust layout or radius constraints.")
 
     order = sorted(range(num_objects), key=lambda idx: float(radius[idx].item()), reverse=True)
     for i in order:
         ri = float(radius[i].item())
+        x_min = -xy_limit + ri + spawn_padding
+        x_max = xy_limit - ri - spawn_padding
+        y_min = y_ground + max(spawn_y_min_ratio * xy_limit, ri + spawn_padding)
+        y_max = y_ground + min(spawn_y_max_ratio * xy_limit, xy_limit - ri - spawn_padding)
+        if x_min >= x_max or y_min >= y_max:
+            raise ValueError("Spawn area is invalid. Adjust layout or radius constraints.")
         placed = False
         for _ in range(max_placement_tries):
             x = rng.uniform(x_min, x_max)
