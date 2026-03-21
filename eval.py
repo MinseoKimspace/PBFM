@@ -88,6 +88,21 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=bool(_get_nested(cfg, "render", "trajectory", default=True)),
     )
+    parser.add_argument(
+        "--render-vector-overlay",
+        action=argparse.BooleanOptionalAction,
+        default=bool(_get_nested(cfg, "render", "vector_overlay", default=False)),
+    )
+    parser.add_argument(
+        "--render-vector-stride",
+        type=int,
+        default=int(_get_nested(cfg, "render", "vector_stride", default=8)),
+    )
+    parser.add_argument(
+        "--render-vector-scale",
+        type=float,
+        default=float(_get_nested(cfg, "render", "vector_scale", default=4.0)),
+    )
     return parser.parse_args(remaining)
 
 
@@ -119,11 +134,13 @@ def sample_flow_euler(
     radius: torch.Tensor,
     steps: int,
     return_trajectory: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+    return_vector_field: bool = False,
+) -> tuple[torch.Tensor, list[torch.Tensor] | None, list[torch.Tensor] | None]:
     if steps < 1:
         raise ValueError(f"sample steps must be >= 1, got {steps}")
     x = x0
     trajectory = [x.detach().clone()] if return_trajectory else None
+    vector_field = [] if return_vector_field else None
     dt = 1.0 / float(steps)
     for i in range(steps):
         t_now = torch.full(
@@ -134,12 +151,12 @@ def sample_flow_euler(
         )
         t_start = torch.zeros_like(t_now)
         v_hat = model(x, t_start, t_now, radius=radius)
+        if vector_field is not None:
+            vector_field.append(v_hat.detach().clone())
         x = x + dt * v_hat
         if trajectory is not None:
             trajectory.append(x.detach().clone())
-    if trajectory is not None:
-        return x, trajectory
-    return x
+    return x, trajectory, vector_field
 
 
 def clamp_state_for_render(
@@ -154,6 +171,25 @@ def clamp_state_for_render(
     return state_render
 
 
+def stack_trajectory_for_render(
+    trajectory: list[torch.Tensor] | None,
+    xy_limit: float,
+    y_ground: float,
+) -> torch.Tensor | None:
+    if trajectory is None:
+        return None
+    return torch.stack(
+        [clamp_state_for_render(state[0], xy_limit=xy_limit, y_ground=y_ground) for state in trajectory],
+        dim=0,
+    )
+
+
+def stack_vector_field_for_render(vector_field: list[torch.Tensor] | None) -> torch.Tensor | None:
+    if vector_field is None:
+        return None
+    return torch.stack([step[0].detach().clone() for step in vector_field], dim=0)
+
+
 def render_model_samples(
     model: torch.nn.Module,
     dataset: RelaxedCirclesDataset,
@@ -164,6 +200,9 @@ def render_model_samples(
     sample_steps: int,
     render_seed: int,
     render_trajectory: bool,
+    render_vector_overlay: bool,
+    render_vector_stride: int,
+    render_vector_scale: float,
 ) -> None:
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -176,6 +215,7 @@ def render_model_samples(
     xy_limit = float(dataset.meta.get("xy_limit", 1.0))
     y_ground = float(dataset.meta.get("y_ground", 0.0))
     count = min(render_count, len(dataset))
+    capture_trace = render_trajectory or render_vector_overlay
 
     with torch.no_grad():
         for idx in range(count):
@@ -183,28 +223,37 @@ def render_model_samples(
             x1 = item["state"].unsqueeze(0).to(device)
             radius = item["radius"].unsqueeze(0).to(device)
             x0 = item["state_init"].unsqueeze(0).to(device)
-            sample_out = sample_flow_euler(
+            x_hat, trajectory, vector_field = sample_flow_euler(
                 model,
                 x0,
                 radius=radius,
                 steps=sample_steps,
-                return_trajectory=render_trajectory,
+                return_trajectory=capture_trace,
+                return_vector_field=render_vector_overlay,
             )
-            if render_trajectory:
-                x_hat, trajectory = sample_out
-            else:
-                x_hat = sample_out
-                trajectory = None
 
             x0_render = clamp_state_for_render(x0[0], xy_limit=xy_limit, y_ground=y_ground)
             x_hat_render = clamp_state_for_render(x_hat[0], xy_limit=xy_limit, y_ground=y_ground)
             x1_render = clamp_state_for_render(x1[0], xy_limit=xy_limit, y_ground=y_ground)
+            trajectory_render = stack_trajectory_for_render(trajectory, xy_limit=xy_limit, y_ground=y_ground)
+            vector_field_render = stack_vector_field_for_render(vector_field)
 
             img_x0 = render_state_image(
                 x0_render.cpu(), radius[0].cpu(), xy_limit=xy_limit, y_ground=y_ground, image_size=render_size
             )
             img_pred = render_state_image(
-                x_hat_render.cpu(), radius[0].cpu(), xy_limit=xy_limit, y_ground=y_ground, image_size=render_size
+                x_hat_render.cpu(),
+                radius[0].cpu(),
+                xy_limit=xy_limit,
+                y_ground=y_ground,
+                image_size=render_size,
+                trajectory=(trajectory_render.cpu() if render_vector_overlay and trajectory_render is not None else None),
+                vector_field=(
+                    vector_field_render.cpu() if render_vector_overlay and vector_field_render is not None else None
+                ),
+                vector_stride=render_vector_stride,
+                vector_scale=render_vector_scale,
+                vector_dt=1.0 / float(sample_steps),
             )
             img_target = render_state_image(
                 x1_render.cpu(), radius[0].cpu(), xy_limit=xy_limit, y_ground=y_ground, image_size=render_size
@@ -238,17 +287,25 @@ def render_model_samples(
 
             canvas.save(out_dir / f"{idx:04d}_x0_pred_target.png")
 
-            if trajectory is not None:
+            if render_trajectory and trajectory_render is not None:
                 traj_dir = out_dir / f"{idx:04d}_trajectory"
                 traj_dir.mkdir(parents=True, exist_ok=True)
-                for step_idx, state_step in enumerate(trajectory):
-                    state_render = clamp_state_for_render(state_step[0], xy_limit=xy_limit, y_ground=y_ground)
+                for step_idx, state_render in enumerate(trajectory_render):
+                    traj_prefix = trajectory_render[: step_idx + 1] if render_vector_overlay else None
+                    vector_prefix = None
+                    if render_vector_overlay and vector_field_render is not None and step_idx > 0:
+                        vector_prefix = vector_field_render[:step_idx]
                     img_step = render_state_image(
                         state_render.cpu(),
                         radius[0].cpu(),
                         xy_limit=xy_limit,
                         y_ground=y_ground,
                         image_size=render_size,
+                        trajectory=(traj_prefix.cpu() if traj_prefix is not None else None),
+                        vector_field=(vector_prefix.cpu() if vector_prefix is not None else None),
+                        vector_stride=render_vector_stride,
+                        vector_scale=render_vector_scale,
+                        vector_dt=1.0 / float(sample_steps),
                     )
                     if img_step is None:
                         print("PIL not available. Skipping render.")
@@ -364,6 +421,9 @@ def main() -> None:
             sample_steps=args.sample_steps,
             render_seed=args.render_seed,
             render_trajectory=args.render_trajectory,
+            render_vector_overlay=args.render_vector_overlay,
+            render_vector_stride=args.render_vector_stride,
+            render_vector_scale=args.render_vector_scale,
         )
 
 

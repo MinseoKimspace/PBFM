@@ -24,3 +24,6 @@ render:
   sample_steps: 64
   seed: 1234
   trajectory: true
+  vector_overlay: false
+  vector_stride: 8
+  vector_scale: 4.0

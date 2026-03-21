@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import torch
@@ -18,12 +19,47 @@ COLOR_CYCLE = [
 ]
 
 
+def _lighten_color(color: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
+    mix = float(min(1.0, max(0.0, factor)))
+    return tuple(int(round(255.0 + (channel - 255.0) * mix)) for channel in color)
+
+
+def _draw_arrow(
+    draw,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    color: tuple[int, int, int],
+    width: int = 2,
+) -> None:
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    norm = math.hypot(dx, dy)
+    if norm < 1e-3:
+        return
+
+    draw.line([start, end], fill=color, width=width)
+    ux = dx / norm
+    uy = dy / norm
+    px = -uy
+    py = ux
+    head_len = min(12.0, max(6.0, 0.35 * norm))
+    head_half_w = 0.5 * head_len
+    left = (end[0] - ux * head_len + px * head_half_w, end[1] - uy * head_len + py * head_half_w)
+    right = (end[0] - ux * head_len - px * head_half_w, end[1] - uy * head_len - py * head_half_w)
+    draw.polygon([end, left, right], fill=color)
+
+
 def render_state_image(
     state: torch.Tensor,
     radius: torch.Tensor,
     xy_limit: float,
     y_ground: float,
     image_size: int,
+    trajectory: torch.Tensor | None = None,
+    vector_field: torch.Tensor | None = None,
+    vector_stride: int = 1,
+    vector_scale: float = 1.0,
+    vector_dt: float = 1.0,
 ):
     try:
         from PIL import Image, ImageDraw
@@ -61,6 +97,27 @@ def render_state_image(
     draw.line([(x0, y_top), (x0, ground_line_y)], fill=(0, 0, 0), width=2)
     draw.line([(x1, y_top), (x1, ground_line_y)], fill=(0, 0, 0), width=2)
     draw.line([(x0, ground_line_y), (x1, ground_line_y)], fill=(0, 0, 0), width=2)
+
+    if trajectory is not None and trajectory.dim() == 3 and trajectory.size(1) == state.size(0):
+        path_color_factor = 0.55
+        stride = max(1, int(vector_stride))
+        for i in range(state.size(0)):
+            color = COLOR_CYCLE[i % len(COLOR_CYCLE)]
+            path_color = _lighten_color(color, path_color_factor)
+            points = [to_px(float(trajectory[s, i, 0]), float(trajectory[s, i, 1])) for s in range(trajectory.size(0))]
+            if len(points) >= 2:
+                draw.line(points, fill=path_color, width=2)
+
+            if vector_field is None:
+                continue
+            max_steps = min(vector_field.size(0), trajectory.size(0))
+            for step_idx in range(0, max_steps, stride):
+                start_world = trajectory[step_idx, i]
+                delta_world = vector_field[step_idx, i] * float(vector_dt * vector_scale)
+                end_world = start_world + delta_world
+                start_px = to_px(float(start_world[0]), float(start_world[1]))
+                end_px = to_px(float(end_world[0]), float(end_world[1]))
+                _draw_arrow(draw, start_px, end_px, color=color, width=2)
 
     for i in range(state.size(0)):
         cx, cy = to_px(float(state[i, 0]), float(state[i, 1]))
