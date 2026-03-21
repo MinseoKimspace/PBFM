@@ -46,6 +46,10 @@ META_KEYS = (
 )
 
 
+class SpawnPlacementError(RuntimeError):
+    pass
+
+
 def _load_yaml_config(config_path: str) -> dict[str, Any]:
     if not config_path:
         return {}
@@ -206,7 +210,8 @@ def _sample_spawn_points(
     spawn_y_max_ratio: float,
     max_placement_tries: int,
 ) -> list[tuple[float, float]]:
-    placements: list[tuple[float, float]] = []
+    placements: list[tuple[float, float] | None] = [None] * num_objects
+    placed_indices: list[int] = []
     r_max = float(radius.max().item())
     x_min = -xy_limit + r_max + spawn_padding
     x_max = xy_limit - r_max - spawn_padding
@@ -215,14 +220,19 @@ def _sample_spawn_points(
     if x_min >= x_max or y_min >= y_max:
         raise ValueError("Spawn area is invalid. Adjust layout or radius constraints.")
 
-    for i in range(num_objects):
+    order = sorted(range(num_objects), key=lambda idx: float(radius[idx].item()), reverse=True)
+    for i in order:
         ri = float(radius[i].item())
         placed = False
         for _ in range(max_placement_tries):
             x = rng.uniform(x_min, x_max)
             y = rng.uniform(y_min, y_max)
             valid = True
-            for j, (px, py) in enumerate(placements):
+            for j in placed_indices:
+                placed_point = placements[j]
+                if placed_point is None:
+                    raise RuntimeError("Internal error: placed index missing spawn point.")
+                px, py = placed_point
                 rj = float(radius[j].item())
                 dx = x - px
                 dy = y - py
@@ -230,16 +240,23 @@ def _sample_spawn_points(
                     valid = False
                     break
             if valid:
-                placements.append((x, y))
+                placements[i] = (x, y)
+                placed_indices.append(i)
                 placed = True
                 break
 
         if not placed:
-            # Fallback placement to keep generation moving even in dense cases.
-            x = rng.uniform(x_min, x_max)
-            y = rng.uniform(y_min, y_max)
-            placements.append((x, y))
-    return placements
+            raise SpawnPlacementError(
+                "Failed to place non-overlapping initial circles. "
+                "Increase max_placement_tries / max_resample_attempts or loosen the layout."
+            )
+
+    result: list[tuple[float, float]] = []
+    for point in placements:
+        if point is None:
+            raise RuntimeError("Internal error: incomplete spawn placement.")
+        result.append((float(point[0]), float(point[1])))
+    return result
 
 
 def _clamp_state_in_layout_inplace(
@@ -437,26 +454,34 @@ def generate_split(
         settle_step = args.max_steps
         settled = 0
         used_attempt = 0
+        last_error: Exception | None = None
 
         for attempt in range(args.max_resample_attempts + 1):
             sample_seed = split_seed + idx * 9973 + attempt * 104729
-            s_init, s_relaxed, settle_step, settled = simulate_one_sample(
-                radius=radius[idx],
-                seed=sample_seed,
-                args=args,
-                b2_world_ctor=b2_world_ctor,
-                b2_circle_shape_ctor=b2_circle_shape_ctor,
-                b2_polygon_shape_ctor=b2_polygon_shape_ctor,
-                support_check_eps=support_check_eps,
-            )
+            try:
+                s_init, s_relaxed, settle_step, settled = simulate_one_sample(
+                    radius=radius[idx],
+                    seed=sample_seed,
+                    args=args,
+                    b2_world_ctor=b2_world_ctor,
+                    b2_circle_shape_ctor=b2_circle_shape_ctor,
+                    b2_polygon_shape_ctor=b2_polygon_shape_ctor,
+                    support_check_eps=support_check_eps,
+                )
+                last_error = None
+            except SpawnPlacementError as exc:
+                last_error = exc
+                continue
             used_attempt = attempt
             if settled:
                 break
 
         if args.require_settled and not settled:
+            extra = f" Last error: {last_error}" if last_error is not None else ""
             raise RuntimeError(
                 f"[{split_name}] sample {idx} failed to settle after {args.max_resample_attempts + 1} attempts. "
                 "Increase max_steps, loosen stability thresholds, or raise max_resample_attempts."
+                f"{extra}"
             )
 
         init_states.append(s_init)
