@@ -30,7 +30,16 @@ class PhysicsEnergyLoss(nn.Module):
         barrier = torch.zeros_like(distance)
         barrier = torch.where(((distance < d_hat) & (distance >= 0)), -(distance - d_hat).pow(2)*torch.log(distance.clamp_min(self.epsilon) / d_hat.clamp_min(self.epsilon)), barrier)
         barrier = torch.where(distance < 0, (-distance + self.epsilon).pow(2) + self.constant, barrier)
-        collision_loss = barrier.masked_select(pair_mask).mean()
+        use_active_pairs_only = True
+        if use_active_pairs_only:
+            active_mask = pair_mask & (distance < d_hat)
+            active_barrier = barrier.masked_select(active_mask)
+            if active_barrier.numel() > 0:
+                collision_loss = active_barrier.mean()
+            else:
+                collision_loss = barrier.new_zeros(())
+        else:
+            collision_loss = barrier.masked_select(pair_mask).mean()
 
         total_loss = (self.gravity_weight * gravity_loss + self.ground_weight * ground_loss + self.collision_weight * collision_loss)
         return total_loss
