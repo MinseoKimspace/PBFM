@@ -89,9 +89,20 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(_get_nested(cfg, "loss", "physics_weight_eps", default=1e-8)),
     )
-    parser.add_argument("--gravity-weight", type=float, default=float(_get_nested(cfg, "loss", "gravity_weight", default=0.2)))
-    parser.add_argument("--ground-weight", type=float, default=float(_get_nested(cfg, "loss", "ground_weight", default=0.2)))
-    parser.add_argument("--collision-weight", type=float, default=float(_get_nested(cfg, "loss", "collision_weight", default=0.2)))
+    parser.add_argument("--gravity-weight", type=float, default=float(_get_nested(cfg, "loss", "gravity_weight", default=0.1)))
+    parser.add_argument("--ground-weight", type=float, default=float(_get_nested(cfg, "loss", "ground_weight", default=0.1)))
+    parser.add_argument("--collision-weight", type=float, default=float(_get_nested(cfg, "loss", "collision_weight", default=0.3)))
+    parser.add_argument("--collision-alpha", type=float, default=float(_get_nested(cfg, "loss", "collision_alpha", default=0.1)))
+    parser.add_argument(
+        "--collision-epsilon",
+        type=float,
+        default=float(_get_nested(cfg, "loss", "collision_epsilon", default=1e-5)),
+    )
+    parser.add_argument(
+        "--collision-constant",
+        type=float,
+        default=float(_get_nested(cfg, "loss", "collision_constant", default=0.01)),
+    )
     parser.add_argument("--y-ground", type=float, default=float(_get_nested(cfg, "loss", "y_ground", default=0.0)))
 
     parser.add_argument("--seed", type=int, default=int(_get_nested(cfg, "runtime", "seed", default=42)))
@@ -227,6 +238,9 @@ def main() -> None:
         "gravity_weight": args.gravity_weight,
         "ground_weight": args.ground_weight,
         "collision_weight": args.collision_weight,
+        "collision_alpha": args.collision_alpha,
+        "collision_epsilon": args.collision_epsilon,
+        "collision_constant": args.collision_constant,
         "y_ground": args.y_ground,
     }
 

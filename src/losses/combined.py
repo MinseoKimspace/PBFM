@@ -13,9 +13,12 @@ class CombinedLoss(nn.Module):
     def __init__(
         self,
         physics_weight: float = 0.1,
-        gravity_weight: float = 0.2,
-        ground_weight: float = 0.2,
-        collision_weight: float = 0.2,
+        gravity_weight: float = 0.1,
+        ground_weight: float = 0.1,
+        collision_weight: float = 0.3,
+        collision_alpha: float = 0.1,
+        collision_epsilon: float = 1e-5,
+        collision_constant: float = 0.01,
         y_ground: float = 0.0,
         physics_weight_min: float = 0.05,
         physics_weight_max: float = 2.0,
@@ -31,6 +34,9 @@ class CombinedLoss(nn.Module):
             gravity_weight=gravity_weight,
             ground_weight=ground_weight,
             collision_weight=collision_weight,
+            alpha=collision_alpha,
+            epsilon=collision_epsilon,
+            constant=collision_constant,
             y_ground=y_ground,
         )
 

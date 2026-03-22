@@ -26,9 +26,12 @@ loss:
   physics_weight_min: 0.05
   physics_weight_max: 2.0
   physics_weight_eps: 1.0e-8
-  gravity_weight: 0.2
-  ground_weight: 0.4
-  collision_weight: 0.4
+  gravity_weight: 0.1
+  ground_weight: 0.1
+  collision_weight: 0.3
+  collision_alpha: 0.1
+  collision_epsilon: 1.0e-5
+  collision_constant: 0.01
   y_ground: 0.0
 
 runtime:

@@ -10,6 +10,9 @@ loss:
   physics_weight_min: 0.05
   physics_weight_max: 2.0
   physics_weight_eps: 1.0e-8
+  collision_alpha: 0.1
+  collision_epsilon: 1.0e-5
+  collision_constant: 0.01
 
 runtime:
   device: cuda

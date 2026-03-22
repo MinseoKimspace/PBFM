@@ -71,6 +71,17 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(_get_nested(cfg, "loss", "physics_weight_eps", default=1e-8)),
     )
+    parser.add_argument("--collision-alpha", type=float, default=float(_get_nested(cfg, "loss", "collision_alpha", default=0.1)))
+    parser.add_argument(
+        "--collision-epsilon",
+        type=float,
+        default=float(_get_nested(cfg, "loss", "collision_epsilon", default=1e-5)),
+    )
+    parser.add_argument(
+        "--collision-constant",
+        type=float,
+        default=float(_get_nested(cfg, "loss", "collision_constant", default=0.01)),
+    )
     parser.add_argument(
         "--device",
         type=str,
@@ -346,6 +357,9 @@ def main() -> None:
             "gravity_weight": 0.2,
             "ground_weight": 0.2,
             "collision_weight": 0.2,
+            "collision_alpha": float(train_args.get("collision_alpha", args.collision_alpha)),
+            "collision_epsilon": float(train_args.get("collision_epsilon", args.collision_epsilon)),
+            "collision_constant": float(train_args.get("collision_constant", args.collision_constant)),
             "y_ground": 0.0,
         },
     )
@@ -357,6 +371,12 @@ def main() -> None:
         loss_kwargs["physics_weight_max"] = float(train_args.get("physics_weight_max", args.physics_weight_max))
     if "physics_weight_eps" not in loss_kwargs:
         loss_kwargs["physics_weight_eps"] = float(train_args.get("physics_weight_eps", args.physics_weight_eps))
+    if "collision_alpha" not in loss_kwargs:
+        loss_kwargs["collision_alpha"] = float(train_args.get("collision_alpha", args.collision_alpha))
+    if "collision_epsilon" not in loss_kwargs:
+        loss_kwargs["collision_epsilon"] = float(train_args.get("collision_epsilon", args.collision_epsilon))
+    if "collision_constant" not in loss_kwargs:
+        loss_kwargs["collision_constant"] = float(train_args.get("collision_constant", args.collision_constant))
 
     dataset_path = args.dataset if args.dataset else str(train_args.get("dataset", ""))
     if not dataset_path:
