@@ -47,6 +47,14 @@ def parse_args() -> argparse.Namespace:
     pre.add_argument("--config", type=str, default="")
     pre_args, remaining = pre.parse_known_args()
     cfg = _load_yaml_config(pre_args.config)
+    vector_overlay_default = bool(
+        _get_nested(
+            cfg,
+            "render",
+            "vector_overlay",
+            default=_get_nested(cfg, "render", "vector_field", default=False),
+        )
+    )
 
     parser = argparse.ArgumentParser(description="Evaluate FM + physics residual checkpoint.")
     parser.add_argument("--config", type=str, default=pre_args.config)
@@ -102,7 +110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--render-vector-overlay",
         action=argparse.BooleanOptionalAction,
-        default=bool(_get_nested(cfg, "render", "vector_overlay", default=False)),
+        default=vector_overlay_default,
     )
     parser.add_argument(
         "--render-vector-stride",
