@@ -51,7 +51,17 @@ class CombinedLoss(nn.Module):
         t_start = torch.zeros_like(t_now)
         v_hat = model(x_t, t_start, t_now, radius=radius)
         fm_term = F.mse_loss(v_hat, target_v)
-        x1_hat = x_t + (1.0 - t_now).unsqueeze(-1) * v_hat
+        steps = 4
+        x = x_t
+        t_cur = t_now
+        dt = (1.0 - t_now) / float(steps)
+        for _ in range(steps):
+            t_mid = t_cur + 0.5 * dt
+            t_start = torch.zeros_like(t_mid)
+            v_hat = model(x, t_start, t_mid, radius=radius)
+            x = x + dt.unsqueeze(-1) * v_hat
+            t_cur = t_cur + dt
+        x1_hat = x
         physics_term = self.physics(x1_hat, radius)
         fm_detached = fm_term.detach()
         physics_detached = physics_term.detach()
