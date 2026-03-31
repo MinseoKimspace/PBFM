@@ -6,8 +6,8 @@ data:
 
 train:
   epochs: 300
-  batch_size: 256
-  lr: 0.0006
+  batch_size: 64
+  lr: 0.00005
   weight_decay: 0.0001
   grad_clip: 1.0
   num_workers: 8
@@ -22,12 +22,9 @@ model:
   use_radius_condition: true
 
 loss:
-  physics_weight: 0.5
-  physics_weight_min: 0.05
-  physics_weight_max: 2.0
-  physics_weight_eps: 1.0e-8
-  gravity_weight: 0.1
-  ground_weight: 0.1
+  physics_weight: 0.05
+  gravity_weight: 0.0
+  ground_weight: 0.05
   collision_weight: 0.3
   collision_alpha: 0.1
   collision_epsilon: 1.0e-5

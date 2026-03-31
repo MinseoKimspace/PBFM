@@ -64,21 +64,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", type=str, default=str(_get_nested(cfg, "eval", "split", default="val")))
     parser.add_argument("--batch-size", type=int, default=int(_get_nested(cfg, "eval", "batch_size", default=256)))
     parser.add_argument("--num-workers", type=int, default=int(_get_nested(cfg, "eval", "num_workers", default=0)))
-    parser.add_argument(
-        "--physics-weight-min",
-        type=float,
-        default=float(_get_nested(cfg, "loss", "physics_weight_min", default=0.05)),
-    )
-    parser.add_argument(
-        "--physics-weight-max",
-        type=float,
-        default=float(_get_nested(cfg, "loss", "physics_weight_max", default=2.0)),
-    )
-    parser.add_argument(
-        "--physics-weight-eps",
-        type=float,
-        default=float(_get_nested(cfg, "loss", "physics_weight_eps", default=1e-8)),
-    )
+    parser.add_argument("--physics-weight", type=float, default=float(_get_nested(cfg, "loss", "physics_weight", default=0.1)))
+    parser.add_argument("--gravity-weight", type=float, default=float(_get_nested(cfg, "loss", "gravity_weight", default=0.0)))
+    parser.add_argument("--ground-weight", type=float, default=float(_get_nested(cfg, "loss", "ground_weight", default=0.1)))
+    parser.add_argument("--collision-weight", type=float, default=float(_get_nested(cfg, "loss", "collision_weight", default=0.3)))
     parser.add_argument("--collision-alpha", type=float, default=float(_get_nested(cfg, "loss", "collision_alpha", default=0.1)))
     parser.add_argument(
         "--collision-epsilon",
@@ -90,6 +79,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(_get_nested(cfg, "loss", "collision_constant", default=0.01)),
     )
+    parser.add_argument("--y-ground", type=float, default=float(_get_nested(cfg, "loss", "y_ground", default=0.0)))
     parser.add_argument(
         "--device",
         type=str,
@@ -358,33 +348,35 @@ def main() -> None:
     loss_kwargs = checkpoint.get(
         "loss_kwargs",
         {
-            "physics_weight": float(checkpoint.get("physics_weight", train_args.get("physics_weight", 0.1))),
-            "physics_weight_min": float(train_args.get("physics_weight_min", args.physics_weight_min)),
-            "physics_weight_max": float(train_args.get("physics_weight_max", args.physics_weight_max)),
-            "physics_weight_eps": float(train_args.get("physics_weight_eps", args.physics_weight_eps)),
-            "gravity_weight": 0.2,
-            "ground_weight": 0.2,
-            "collision_weight": 0.2,
+            "physics_weight": float(checkpoint.get("physics_weight", train_args.get("physics_weight", args.physics_weight))),
+            "gravity_weight": float(train_args.get("gravity_weight", args.gravity_weight)),
+            "ground_weight": float(train_args.get("ground_weight", args.ground_weight)),
+            "collision_weight": float(train_args.get("collision_weight", args.collision_weight)),
             "collision_alpha": float(train_args.get("collision_alpha", args.collision_alpha)),
             "collision_epsilon": float(train_args.get("collision_epsilon", args.collision_epsilon)),
             "collision_constant": float(train_args.get("collision_constant", args.collision_constant)),
-            "y_ground": 0.0,
+            "y_ground": float(train_args.get("y_ground", args.y_ground)),
         },
     )
     if "physics_weight" not in loss_kwargs:
-        loss_kwargs["physics_weight"] = float(checkpoint.get("physics_weight", train_args.get("physics_weight", 0.1)))
-    if "physics_weight_min" not in loss_kwargs:
-        loss_kwargs["physics_weight_min"] = float(train_args.get("physics_weight_min", args.physics_weight_min))
-    if "physics_weight_max" not in loss_kwargs:
-        loss_kwargs["physics_weight_max"] = float(train_args.get("physics_weight_max", args.physics_weight_max))
-    if "physics_weight_eps" not in loss_kwargs:
-        loss_kwargs["physics_weight_eps"] = float(train_args.get("physics_weight_eps", args.physics_weight_eps))
+        loss_kwargs["physics_weight"] = float(checkpoint.get("physics_weight", train_args.get("physics_weight", args.physics_weight)))
+    if "gravity_weight" not in loss_kwargs:
+        loss_kwargs["gravity_weight"] = float(train_args.get("gravity_weight", args.gravity_weight))
+    if "ground_weight" not in loss_kwargs:
+        loss_kwargs["ground_weight"] = float(train_args.get("ground_weight", args.ground_weight))
+    if "collision_weight" not in loss_kwargs:
+        loss_kwargs["collision_weight"] = float(train_args.get("collision_weight", args.collision_weight))
     if "collision_alpha" not in loss_kwargs:
         loss_kwargs["collision_alpha"] = float(train_args.get("collision_alpha", args.collision_alpha))
     if "collision_epsilon" not in loss_kwargs:
         loss_kwargs["collision_epsilon"] = float(train_args.get("collision_epsilon", args.collision_epsilon))
     if "collision_constant" not in loss_kwargs:
         loss_kwargs["collision_constant"] = float(train_args.get("collision_constant", args.collision_constant))
+    if "y_ground" not in loss_kwargs:
+        loss_kwargs["y_ground"] = float(train_args.get("y_ground", args.y_ground))
+    loss_kwargs.pop("physics_weight_min", None)
+    loss_kwargs.pop("physics_weight_max", None)
+    loss_kwargs.pop("physics_weight_eps", None)
 
     dataset_path = args.dataset if args.dataset else str(train_args.get("dataset", ""))
     if not dataset_path:

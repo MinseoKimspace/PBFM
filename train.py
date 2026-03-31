@@ -74,21 +74,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-radius-condition", dest="use_radius_condition", action="store_false")
 
     parser.add_argument("--physics-weight", type=float, default=float(_get_nested(cfg, "loss", "physics_weight", default=0.1)))
-    parser.add_argument(
-        "--physics-weight-min",
-        type=float,
-        default=float(_get_nested(cfg, "loss", "physics_weight_min", default=0.05)),
-    )
-    parser.add_argument(
-        "--physics-weight-max",
-        type=float,
-        default=float(_get_nested(cfg, "loss", "physics_weight_max", default=2.0)),
-    )
-    parser.add_argument(
-        "--physics-weight-eps",
-        type=float,
-        default=float(_get_nested(cfg, "loss", "physics_weight_eps", default=1e-8)),
-    )
     parser.add_argument("--gravity-weight", type=float, default=float(_get_nested(cfg, "loss", "gravity_weight", default=0.1)))
     parser.add_argument("--ground-weight", type=float, default=float(_get_nested(cfg, "loss", "ground_weight", default=0.1)))
     parser.add_argument("--collision-weight", type=float, default=float(_get_nested(cfg, "loss", "collision_weight", default=0.3)))
@@ -232,9 +217,6 @@ def main() -> None:
     }
     loss_kwargs = {
         "physics_weight": args.physics_weight,
-        "physics_weight_min": args.physics_weight_min,
-        "physics_weight_max": args.physics_weight_max,
-        "physics_weight_eps": args.physics_weight_eps,
         "gravity_weight": args.gravity_weight,
         "ground_weight": args.ground_weight,
         "collision_weight": args.collision_weight,
@@ -297,8 +279,6 @@ def main() -> None:
             f"train_loss={train_loss:.6f} val_loss={val_loss:.6f} "
             f"fm={val_metrics.get('fm', float('nan')):.6f} "
             f"physics={val_metrics.get('physics', float('nan')):.6f} "
-            f"fm/physics={val_metrics.get('fm_over_physics', float('nan')):.6f} "
-            f"w_eff={val_metrics.get('physics_weight_eff', float('nan')):.6f} "
             f"res/fm={val_metrics.get('physics_residual_over_fm', float('nan')):.6f}"
         )
 

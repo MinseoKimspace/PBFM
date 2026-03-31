@@ -17,9 +17,9 @@ class PhysicsEnergyLoss(nn.Module):
         self.constant = constant
 
     def forward(self, pos: torch.Tensor, radius: torch.Tensor): # pos = (B, N, 2), radius = (B, N)
-        gravity_loss = torch.mean(pos[:, :, 1])
+        gravity_loss = torch.mean(pos[:, :, 1], dim=1)
 
-        ground_loss = torch.mean(F.relu(radius[:,:] - pos[:, :, 1] + self.y_ground))
+        ground_loss = torch.mean(F.relu(radius[:,:] - pos[:, :, 1] + self.y_ground), dim=1)
         
         pairwise_distances = pos[:, :, None, :] - pos[:, None, :, :]
         pairwise_radius = radius[:, :, None] + radius[:, None, :]
@@ -31,15 +31,19 @@ class PhysicsEnergyLoss(nn.Module):
         barrier = torch.where(((distance < d_hat) & (distance >= 0)), -(distance - d_hat).pow(2)*torch.log(distance.clamp_min(self.epsilon) / d_hat.clamp_min(self.epsilon)), barrier)
         barrier = torch.where(distance < 0, (-distance + self.epsilon).pow(2) + self.constant, barrier)
         use_active_pairs_only = True
+        pair_mask = pair_mask.expand(distance.size(0), -1, -1)
         if use_active_pairs_only:
-            active_mask = pair_mask & (distance < d_hat)
-            active_barrier = barrier.masked_select(active_mask)
-            if active_barrier.numel() > 0:
-                collision_loss = active_barrier.mean()
-            else:
-                collision_loss = barrier.new_zeros(())
+            reduce_mask = pair_mask & (distance < d_hat)
         else:
-            collision_loss = barrier.masked_select(pair_mask).mean()
+            reduce_mask = pair_mask
+
+        reduce_mask_f = reduce_mask.to(barrier.dtype)
+        collision_sum = (barrier * reduce_mask_f).sum(dim=(1, 2))
+        collision_count = reduce_mask.sum(dim=(1, 2)).clamp_min(1)
+        collision_loss = collision_sum / collision_count
+        
+        has_active = reduce_mask.any(dim=(1, 2))
+        collision_loss = torch.where(has_active, collision_loss, torch.zeros_like(collision_loss))
 
         total_loss = (self.gravity_weight * gravity_loss + self.ground_weight * ground_loss + self.collision_weight * collision_loss)
         return total_loss

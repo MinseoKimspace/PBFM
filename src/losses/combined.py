@@ -20,16 +20,10 @@ class CombinedLoss(nn.Module):
         collision_epsilon: float = 1e-5,
         collision_constant: float = 0.01,
         y_ground: float = 0.0,
-        physics_weight_min: float = 0.05,
-        physics_weight_max: float = 2.0,
-        physics_weight_eps: float = 1e-8,
     ) -> None:
         
         super().__init__()
         self.physics_weight = physics_weight
-        self.physics_weight_min = physics_weight_min
-        self.physics_weight_max = physics_weight_max
-        self.physics_weight_eps = physics_weight_eps
         self.physics = PhysicsEnergyLoss(
             gravity_weight=gravity_weight,
             ground_weight=ground_weight,
@@ -62,23 +56,17 @@ class CombinedLoss(nn.Module):
             x = x + dt.unsqueeze(-1) * v_hat
             t_cur = t_cur + dt
         x1_hat = x
-        physics_term = self.physics(x1_hat, radius)
+        physics_per_sample = self.physics(x1_hat, radius)
+        t_scale = t_now.squeeze(-1)
+        scaled_physics = t_scale * physics_per_sample
+        physics_term = scaled_physics.mean()
+
+        metric_eps = 1e-8
         fm_detached = fm_term.detach()
         physics_detached = physics_term.detach()
-        fm_over_physics = fm_detached / (physics_detached + self.physics_weight_eps)
-
-        # Dynamic balance: keep physics term from being drowned out by FM scale.
-        physics_weight_eff = self.physics_weight * (
-            fm_over_physics
-        )
-        physics_weight_eff = torch.clamp(
-            physics_weight_eff,
-            min=self.physics_weight_min,
-            max=self.physics_weight_max,
-        )
-        residual = physics_weight_eff * physics_term
+        residual = self.physics_weight * physics_term
         total = fm_term + residual
-        residual_over_fm = residual.detach() / (fm_detached + self.physics_weight_eps)
+        residual_over_fm = residual.detach() / (fm_detached + metric_eps)
         fm_metrics = {
             "loss": float(fm_detached.item()),
             "v_mse": float(fm_detached.item()),
@@ -88,10 +76,8 @@ class CombinedLoss(nn.Module):
             "loss": float(total.detach().item()),
             "fm": float(fm_detached.item()),
             "physics": float(physics_detached.item()),
-            "fm_over_physics": float(fm_over_physics.item()),
             "physics_residual": float(residual.detach().item()),
             "physics_residual_over_fm": float(residual_over_fm.item()),
-            "physics_weight_eff": float(physics_weight_eff.detach().item()),
         }
         metrics.update({f"fm_{k}": v for k, v in fm_metrics.items()})
         return total, metrics
