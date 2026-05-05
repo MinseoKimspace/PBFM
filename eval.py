@@ -68,18 +68,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gravity-weight", type=float, default=float(_get_nested(cfg, "loss", "gravity_weight", default=0.0)))
     parser.add_argument("--ground-weight", type=float, default=float(_get_nested(cfg, "loss", "ground_weight", default=0.1)))
     parser.add_argument("--collision-weight", type=float, default=float(_get_nested(cfg, "loss", "collision_weight", default=0.3)))
-    parser.add_argument("--collision-alpha", type=float, default=float(_get_nested(cfg, "loss", "collision_alpha", default=0.1)))
-    parser.add_argument(
-        "--collision-epsilon",
-        type=float,
-        default=float(_get_nested(cfg, "loss", "collision_epsilon", default=1e-5)),
-    )
-    parser.add_argument(
-        "--collision-constant",
-        type=float,
-        default=float(_get_nested(cfg, "loss", "collision_constant", default=0.01)),
-    )
+    parser.add_argument("--collision-alpha", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--collision-epsilon", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--collision-constant", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--y-ground", type=float, default=float(_get_nested(cfg, "loss", "y_ground", default=0.0)))
+    parser.add_argument("--unroll-steps", type=int, default=int(_get_nested(cfg, "loss", "unroll_steps", default=4)))
     parser.add_argument(
         "--device",
         type=str,
@@ -352,10 +345,8 @@ def main() -> None:
             "gravity_weight": float(train_args.get("gravity_weight", args.gravity_weight)),
             "ground_weight": float(train_args.get("ground_weight", args.ground_weight)),
             "collision_weight": float(train_args.get("collision_weight", args.collision_weight)),
-            "collision_alpha": float(train_args.get("collision_alpha", args.collision_alpha)),
-            "collision_epsilon": float(train_args.get("collision_epsilon", args.collision_epsilon)),
-            "collision_constant": float(train_args.get("collision_constant", args.collision_constant)),
             "y_ground": float(train_args.get("y_ground", args.y_ground)),
+            "unroll_steps": int(train_args.get("unroll_steps", args.unroll_steps)),
         },
     )
     if "physics_weight" not in loss_kwargs:
@@ -366,14 +357,10 @@ def main() -> None:
         loss_kwargs["ground_weight"] = float(train_args.get("ground_weight", args.ground_weight))
     if "collision_weight" not in loss_kwargs:
         loss_kwargs["collision_weight"] = float(train_args.get("collision_weight", args.collision_weight))
-    if "collision_alpha" not in loss_kwargs:
-        loss_kwargs["collision_alpha"] = float(train_args.get("collision_alpha", args.collision_alpha))
-    if "collision_epsilon" not in loss_kwargs:
-        loss_kwargs["collision_epsilon"] = float(train_args.get("collision_epsilon", args.collision_epsilon))
-    if "collision_constant" not in loss_kwargs:
-        loss_kwargs["collision_constant"] = float(train_args.get("collision_constant", args.collision_constant))
     if "y_ground" not in loss_kwargs:
         loss_kwargs["y_ground"] = float(train_args.get("y_ground", args.y_ground))
+    if "unroll_steps" not in loss_kwargs:
+        loss_kwargs["unroll_steps"] = int(train_args.get("unroll_steps", args.unroll_steps))
     loss_kwargs.pop("physics_weight_min", None)
     loss_kwargs.pop("physics_weight_max", None)
     loss_kwargs.pop("physics_weight_eps", None)

@@ -16,23 +16,27 @@ class CombinedLoss(nn.Module):
         gravity_weight: float = 0.1,
         ground_weight: float = 0.1,
         collision_weight: float = 0.3,
-        collision_alpha: float = 0.1,
-        collision_epsilon: float = 1e-5,
-        collision_constant: float = 0.01,
+        collision_alpha: float | None = None,
+        collision_epsilon: float | None = None,
+        collision_constant: float | None = None,
         y_ground: float = 0.0,
+        unroll_steps: int = 4,
     ) -> None:
         
         super().__init__()
         self.physics_weight = physics_weight
+        self.set_unroll_steps(unroll_steps)
         self.physics = PhysicsEnergyLoss(
             gravity_weight=gravity_weight,
             ground_weight=ground_weight,
             collision_weight=collision_weight,
-            alpha=collision_alpha,
-            epsilon=collision_epsilon,
-            constant=collision_constant,
             y_ground=y_ground,
         )
+
+    def set_unroll_steps(self, steps: int) -> None:
+        if steps < 1:
+            raise ValueError(f"unroll_steps must be >= 1, got {steps}")
+        self.unroll_steps = int(steps)
 
     def forward(
         self,
@@ -45,7 +49,7 @@ class CombinedLoss(nn.Module):
         t_start = torch.zeros_like(t_now)
         v_hat = model(x_t, t_start, t_now, radius=radius)
         fm_term = F.mse_loss(v_hat, target_v)
-        steps = 4
+        steps = self.unroll_steps
         x = x_t
         t_cur = t_now
         dt = (1.0 - t_now) / float(steps)
@@ -58,8 +62,7 @@ class CombinedLoss(nn.Module):
         x1_hat = x
         physics_per_sample = self.physics(x1_hat, radius)
         t_scale = t_now.squeeze(-1)
-        scaled_physics = t_scale * physics_per_sample
-        physics_term = scaled_physics.mean()
+        physics_term = (t_scale * physics_per_sample).mean()
 
         metric_eps = 1e-8
         fm_detached = fm_term.detach()
@@ -78,6 +81,7 @@ class CombinedLoss(nn.Module):
             "physics": float(physics_detached.item()),
             "physics_residual": float(residual.detach().item()),
             "physics_residual_over_fm": float(residual_over_fm.item()),
+            "unroll_steps": float(self.unroll_steps),
         }
         metrics.update({f"fm_{k}": v for k, v in fm_metrics.items()})
         return total, metrics

@@ -77,18 +77,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gravity-weight", type=float, default=float(_get_nested(cfg, "loss", "gravity_weight", default=0.1)))
     parser.add_argument("--ground-weight", type=float, default=float(_get_nested(cfg, "loss", "ground_weight", default=0.1)))
     parser.add_argument("--collision-weight", type=float, default=float(_get_nested(cfg, "loss", "collision_weight", default=0.3)))
-    parser.add_argument("--collision-alpha", type=float, default=float(_get_nested(cfg, "loss", "collision_alpha", default=0.1)))
-    parser.add_argument(
-        "--collision-epsilon",
-        type=float,
-        default=float(_get_nested(cfg, "loss", "collision_epsilon", default=1e-5)),
-    )
-    parser.add_argument(
-        "--collision-constant",
-        type=float,
-        default=float(_get_nested(cfg, "loss", "collision_constant", default=0.01)),
-    )
+    parser.add_argument("--collision-alpha", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--collision-epsilon", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--collision-constant", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--y-ground", type=float, default=float(_get_nested(cfg, "loss", "y_ground", default=0.0)))
+    parser.add_argument("--unroll-steps", type=int, default=int(_get_nested(cfg, "loss", "unroll_steps", default=4)))
+    parser.add_argument(
+        "--unroll-curriculum-epochs",
+        type=int,
+        default=int(_get_nested(cfg, "loss", "unroll_curriculum_epochs", default=0)),
+    )
 
     parser.add_argument("--seed", type=int, default=int(_get_nested(cfg, "runtime", "seed", default=42)))
     parser.add_argument(
@@ -132,6 +130,15 @@ def mean_metrics(metrics: Iterable[Dict[str, float]]) -> Dict[str, float]:
     return {key: value / n for key, value in sums.items()}
 
 
+def get_unroll_steps(epoch: int, max_steps: int, curriculum_epochs: int) -> int:
+    if max_steps < 1:
+        raise ValueError(f"unroll_steps must be >= 1, got {max_steps}")
+    if curriculum_epochs <= 0 or max_steps == 1:
+        return max_steps
+    progress = min(1.0, max(epoch, 1) / float(curriculum_epochs))
+    return min(max_steps, max(1, int(1 + progress * (max_steps - 1))))
+
+
 def run_epoch(
     model: torch.nn.Module,
     criterion: CombinedLoss,
@@ -169,6 +176,8 @@ def run_epoch(
 
 def main() -> None:
     args = parse_args()
+    if args.unroll_steps < 1:
+        raise ValueError(f"unroll_steps must be >= 1, got {args.unroll_steps}")
     set_seed(args.seed)
     device = resolve_device(args.device)
 
@@ -220,10 +229,8 @@ def main() -> None:
         "gravity_weight": args.gravity_weight,
         "ground_weight": args.ground_weight,
         "collision_weight": args.collision_weight,
-        "collision_alpha": args.collision_alpha,
-        "collision_epsilon": args.collision_epsilon,
-        "collision_constant": args.collision_constant,
         "y_ground": args.y_ground,
+        "unroll_steps": args.unroll_steps,
     }
 
     model = FlowVelocityNet(**model_kwargs).to(device)
@@ -239,6 +246,12 @@ def main() -> None:
         "path=state_init->state_relaxed"
     )
     for epoch in range(1, args.epochs + 1):
+        unroll_steps = get_unroll_steps(
+            epoch=epoch,
+            max_steps=args.unroll_steps,
+            curriculum_epochs=args.unroll_curriculum_epochs,
+        )
+        criterion.set_unroll_steps(unroll_steps)
         train_metrics = run_epoch(
             model=model,
             criterion=criterion,
@@ -257,14 +270,22 @@ def main() -> None:
 
         train_loss = train_metrics.get("loss", float("nan"))
         val_loss = val_metrics.get("loss", float("nan"))
-        history.append({"epoch": float(epoch), "train_loss": train_loss, "val_loss": val_loss})
+        history.append(
+            {
+                "epoch": float(epoch),
+                "unroll_steps": float(unroll_steps),
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+            }
+        )
+        checkpoint_loss_kwargs = {**loss_kwargs, "unroll_steps": unroll_steps}
 
         checkpoint = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "model_kwargs": model_kwargs,
-            "loss_kwargs": loss_kwargs,
+            "loss_kwargs": checkpoint_loss_kwargs,
             "train_args": vars(args),
             "train_metrics": train_metrics,
             "val_metrics": val_metrics,
@@ -277,6 +298,7 @@ def main() -> None:
         print(
             f"[{epoch:03d}/{args.epochs:03d}] "
             f"train_loss={train_loss:.6f} val_loss={val_loss:.6f} "
+            f"unroll={unroll_steps} "
             f"fm={val_metrics.get('fm', float('nan')):.6f} "
             f"physics={val_metrics.get('physics', float('nan')):.6f} "
             f"res/fm={val_metrics.get('physics_residual_over_fm', float('nan')):.6f}"
