@@ -41,7 +41,7 @@ box2d:
 
 runtime:
   seed: 42
-  require_settled: true
+  require_settled: false
   max_resample_attempts: 32
 
 render:

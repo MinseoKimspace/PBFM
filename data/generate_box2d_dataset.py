@@ -79,7 +79,7 @@ def parse_args() -> argparse.Namespace:
         linear_velocity_eps=float(get(cfg, "box2d", "linear_velocity_eps", 0.03)),
         angular_velocity_eps=float(get(cfg, "box2d", "angular_velocity_eps", 0.05)),
         seed=int(get(cfg, "runtime", "seed", 42)),
-        require_settled=bool(get(cfg, "runtime", "require_settled", True)),
+        require_settled=bool(get(cfg, "runtime", "require_settled", False)),
         max_resample_attempts=int(get(cfg, "runtime", "max_resample_attempts", 8)),
         render_dir=str(get(cfg, "render", "dir", "")) if render_enabled else "",
         render_split=str(get(cfg, "render", "split", "train")),
@@ -343,7 +343,12 @@ def generate_split(
                 break
 
         if episode is None:
-            raise RuntimeError(f"[{split}] failed to generate a settled episode. Last error: {last_error}")
+            raise RuntimeError(
+                f"[{split}] failed to generate a settled episode after {args.max_resample_attempts + 1} attempts. "
+                "For next-step dynamic data, set runtime.require_settled=false. "
+                "If settled-only data is intentional, increase box2d.max_steps or relax the velocity thresholds. "
+                f"Last placement error: {last_error}"
+            )
 
         source, target = episode
         if args.rollout_steps > 0 and len(rollout_initial_chunks) < args.rollout_count:
