@@ -9,79 +9,51 @@ import torch.nn.functional as F
 from src.losses.physics_energy import PhysicsEnergyLoss
 from src.paths.linear import sample_linear_path
 
-class CombinedLoss(nn.Module):
+
+class ProjectionFlowLoss(nn.Module):
     def __init__(
         self,
         physics_weight: float = 0.1,
-        gravity_weight: float = 0.1,
         ground_weight: float = 0.1,
         collision_weight: float = 0.3,
-        collision_alpha: float | None = None,
-        collision_epsilon: float | None = None,
-        collision_constant: float | None = None,
         y_ground: float = 0.0,
         unroll_steps: int = 4,
     ) -> None:
-        
         super().__init__()
         self.physics_weight = physics_weight
-        self.set_unroll_steps(unroll_steps)
+        self.unroll_steps = unroll_steps
         self.physics = PhysicsEnergyLoss(
-            gravity_weight=gravity_weight,
             ground_weight=ground_weight,
             collision_weight=collision_weight,
             y_ground=y_ground,
         )
 
-    def set_unroll_steps(self, steps: int) -> None:
-        if steps < 1:
-            raise ValueError(f"unroll_steps must be >= 1, got {steps}")
-        self.unroll_steps = int(steps)
-
     def forward(
         self,
         model: torch.nn.Module,
-        x0: torch.Tensor,
-        x1: torch.Tensor, # (B,N,2)
-        radius: torch.Tensor, # (B,N)
+        source: torch.Tensor,
+        target: torch.Tensor,
+        radius: torch.Tensor,
+        condition: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        _, x_t, t_now, target_v = sample_linear_path(x0, x1)
-        t_start = torch.zeros_like(t_now)
-        v_hat = model(x_t, t_start, t_now, radius=radius)
-        fm_term = F.mse_loss(v_hat, target_v)
-        steps = self.unroll_steps
-        x = x_t
-        t_cur = t_now
-        dt = (1.0 - t_now) / float(steps)
-        for _ in range(steps):
-            t_mid = t_cur + 0.5 * dt
-            t_start = torch.zeros_like(t_mid)
-            v_hat = model(x, t_start, t_mid, radius=radius)
-            x = x + dt.unsqueeze(-1) * v_hat
-            t_cur = t_cur + dt
-        x1_hat = x
-        physics_per_sample = self.physics(x1_hat, radius)
-        t_scale = t_now.squeeze(-1)
-        physics_term = (t_scale * physics_per_sample).mean()
+        _, z_tau, tau, target_v = sample_linear_path(source, target)
+        v_hat = model(z_tau, tau, radius, condition)
+        fm_loss = F.mse_loss(v_hat, target_v)
 
-        metric_eps = 1e-8
-        fm_detached = fm_term.detach()
-        physics_detached = physics_term.detach()
-        residual = self.physics_weight * physics_term
-        total = fm_term + residual
-        residual_over_fm = residual.detach() / (fm_detached + metric_eps)
-        fm_metrics = {
-            "loss": float(fm_detached.item()),
-            "v_mse": float(fm_detached.item()),
-        }
+        z = source
+        physics_loss = source.new_tensor(0.0)
+        dtau = 1.0 / float(self.unroll_steps)
+        for step in range(self.unroll_steps):
+            tau_mid = source.new_full((source.size(0), 1), (step + 0.5) * dtau)
+            z = z + dtau * model(z, tau_mid, radius, condition)
+            physics_loss = physics_loss + self.physics(z[..., :2], radius).mean()
+        physics_loss = physics_loss / float(self.unroll_steps)
 
+        total = fm_loss + self.physics_weight * physics_loss
         metrics = {
             "loss": float(total.detach().item()),
-            "fm": float(fm_detached.item()),
-            "physics": float(physics_detached.item()),
-            "physics_residual": float(residual.detach().item()),
-            "physics_residual_over_fm": float(residual_over_fm.item()),
+            "fm": float(fm_loss.detach().item()),
+            "physics": float(physics_loss.detach().item()),
             "unroll_steps": float(self.unroll_steps),
         }
-        metrics.update({f"fm_{k}": v for k, v in fm_metrics.items()})
         return total, metrics

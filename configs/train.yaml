@@ -1,34 +1,28 @@
 # Config for train.py
 data:
-  dataset: data/box2d_circles.pt
+  dataset: data/box2d_projection.pt
   train_split: train
   val_split: val
 
 train:
   epochs: 300
-  batch_size: 64
-  lr: 0.00005
+  batch_size: 1024
+  lr: 0.0003
   weight_decay: 0.0001
   grad_clip: 1.0
   num_workers: 8
 
 model:
-  hidden_dim: 256
-  time_dim: 128
-  num_layers: 6
-  num_heads: 8
-  dropout: 0.05
-  ffn_mult: 4
-  use_radius_condition: true
+  hidden_dim: 384
+  time_dim: 64
+  num_layers: 4
 
 loss:
-  physics_weight: 0.05
-  gravity_weight: 0.0
-  ground_weight: 0.05
-  collision_weight: 0.3
+  physics_weight: 0.5
+  ground_weight: 1.0
+  collision_weight: 1.0
   y_ground: 0.0
-  unroll_steps: 4
-  unroll_curriculum_epochs: 100
+  unroll_steps: 8
 
 runtime:
   seed: 42

@@ -1,12 +1,13 @@
 # Config for data/generate_box2d_dataset.py
 dataset:
-  output: data/box2d_circles.pt
+  output: data/box2d_projection.pt
   train_samples: 131072
   val_samples: 16384
   test_samples: 16384
   num_objects: 15
   radius_min: 0.5
   radius_max: 1.5
+  transitions_per_world: 128
 
 layout:
   xy_limit: 10.0
@@ -37,11 +38,10 @@ runtime:
   seed: 42
   require_settled: true
   max_resample_attempts: 32
-  support_check_eps: 0.02
 
 render:
   enabled: true
-  dir: data/renders_box2d
+  dir: data/renders_projection
   split: train
   count: 6
   size: 1024

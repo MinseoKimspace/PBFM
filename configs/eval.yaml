@@ -1,18 +1,9 @@
-# Config for eval.py
 eval:
   checkpoint: ""
   dataset: ""
   split: val
   batch_size: 4096
   num_workers: 8
-
-loss:
-  physics_weight: 0.05
-  gravity_weight: 0.0
-  ground_weight: 0.05
-  collision_weight: 0.3
-  y_ground: 0.0
-  unroll_steps: 4
 
 runtime:
   device: cuda
@@ -24,9 +15,4 @@ render:
   dir: ""
   count: 8
   size: 1024
-  sample_steps: 64
-  seed: 1234
-  trajectory: true
-  vector_overlay: false
-  vector_stride: 8
-  vector_scale: 4.0
+  sample_steps: 4

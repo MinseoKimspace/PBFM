@@ -136,7 +136,7 @@ def render_one(
     image_size: int,
 ) -> None:
     canvas = render_state_image(
-        state=state,
+        state=state[..., :2],
         radius=radius,
         xy_limit=xy_limit,
         y_ground=y_ground,
@@ -145,6 +145,69 @@ def render_one(
     if canvas is None:
         print("PIL not available. Skipping render.")
         return
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output_path)
+
+
+def render_transition_panel(
+    condition: torch.Tensor,
+    source: torch.Tensor,
+    target: torch.Tensor,
+    radius: torch.Tensor,
+    output_path: Path,
+    xy_limit: float,
+    y_ground: float,
+    image_size: int,
+    labels: tuple[str, str, str] = ("condition", "proposal", "target"),
+) -> None:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:
+        print("PIL not available. Skipping render.")
+        return
+
+    condition_pos = condition[..., :2]
+    source_pos = source[..., :2]
+    target_pos = target[..., :2]
+    panels = [
+        render_state_image(condition_pos, radius, xy_limit, y_ground, image_size),
+        render_state_image(
+            source_pos,
+            radius,
+            xy_limit,
+            y_ground,
+            image_size,
+            trajectory=torch.stack([condition_pos, source_pos], dim=0),
+        ),
+        render_state_image(
+            target_pos,
+            radius,
+            xy_limit,
+            y_ground,
+            image_size,
+            trajectory=torch.stack([source_pos, target_pos], dim=0),
+        ),
+    ]
+    if any(panel is None for panel in panels):
+        print("PIL not available. Skipping render.")
+        return
+
+    panel_w, panel_h = panels[0].size
+    caption_h = 32
+    canvas = Image.new("RGB", (panel_w * 3, panel_h + caption_h), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font = ImageFont.truetype("arial.ttf", 18)
+    except Exception:
+        font = ImageFont.load_default()
+
+    for col, (panel, label) in enumerate(zip(panels, labels)):
+        x_left = col * panel_w
+        canvas.paste(panel, (x_left, caption_h))
+        bbox = draw.textbbox((0, 0), label, font=font)
+        text_w = bbox[2] - bbox[0]
+        draw.text((x_left + (panel_w - text_w) * 0.5, 7), label, fill=(0, 0, 0), font=font)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(output_path)
@@ -159,32 +222,14 @@ def render_split_samples(
     y_ground: float,
     image_size: int,
 ) -> None:
-    num_total = split_data["state_init"].size(0)
-    settled = split_data.get("settled")
-    if settled is not None:
-        settled_idx = torch.nonzero(settled > 0, as_tuple=False).squeeze(-1)
-        indices = settled_idx.tolist()
-    else:
-        indices = list(range(num_total))
-
-    if not indices:
-        print(f"[{split_name}] no settled samples available for rendering.")
-        return
-
-    selected = indices[: min(count, len(indices))]
-    for idx in selected:
-        render_one(
-            split_data["state_init"][idx],
-            split_data["radius"][idx],
-            render_dir / f"{split_name}_{idx:04d}_init.png",
-            xy_limit=xy_limit,
-            y_ground=y_ground,
-            image_size=image_size,
-        )
-        render_one(
-            split_data["state_relaxed"][idx],
-            split_data["radius"][idx],
-            render_dir / f"{split_name}_{idx:04d}_relaxed.png",
+    num_total = split_data["source"].size(0)
+    for idx in range(min(count, num_total)):
+        render_transition_panel(
+            condition=split_data["condition"][idx],
+            source=split_data["source"][idx],
+            target=split_data["target"][idx],
+            radius=split_data["radius"][idx],
+            output_path=render_dir / f"{split_name}_{idx:04d}_transition.png",
             xy_limit=xy_limit,
             y_ground=y_ground,
             image_size=image_size,

@@ -3,167 +3,71 @@ from __future__ import annotations
 import argparse
 import json
 import random
-from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable
+from typing import Any
 
-import numpy as np
 import torch
-import yaml
 from torch.utils.data import DataLoader
 
-from data.dataset import RelaxedCirclesDataset
-from src.losses.combined import CombinedLoss
+from data.dataset import ProjectionTransitionDataset
+from src.losses.combined import ProjectionFlowLoss
 from src.models.network import FlowVelocityNet
 
-
-def _load_yaml_config(config_path: str) -> dict[str, Any]:
-    if not config_path:
-        return {}
-    path = Path(config_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {path}")
-    with path.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    if not isinstance(data, dict):
-        raise ValueError(f"Config root must be a mapping, got {type(data)!r}")
-    return data
+try:
+    import yaml
+except ModuleNotFoundError:
+    yaml = None
 
 
-def _get_nested(config: Mapping[str, Any], *keys: str, default: Any) -> Any:
-    cur: Any = config
-    for key in keys:
-        if not isinstance(cur, Mapping) or key not in cur:
-            return default
-        cur = cur[key]
-    return cur
+def load_config(path: str) -> dict[str, Any]:
+    if yaml is None:
+        raise RuntimeError("PyYAML is required. Install requirements.txt first.")
+    with Path(path).open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
 
-def parse_args() -> argparse.Namespace:
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--config", type=str, default="")
-    pre_args, remaining = pre.parse_known_args()
-    cfg = _load_yaml_config(pre_args.config)
-
-    parser = argparse.ArgumentParser(description="Train flow model with FM + weighted physics residual.")
-    parser.add_argument("--config", type=str, default=pre_args.config)
-
-    parser.add_argument("--dataset", type=str, default=_get_nested(cfg, "data", "dataset", default="data/relaxed_circles.pt"))
-    parser.add_argument("--train-split", type=str, default=_get_nested(cfg, "data", "train_split", default="train"))
-    parser.add_argument("--val-split", type=str, default=_get_nested(cfg, "data", "val_split", default="val"))
-    parser.add_argument("--epochs", type=int, default=int(_get_nested(cfg, "train", "epochs", default=30)))
-    parser.add_argument("--batch-size", type=int, default=int(_get_nested(cfg, "train", "batch_size", default=128)))
-    parser.add_argument("--lr", type=float, default=float(_get_nested(cfg, "train", "lr", default=1e-3)))
-    parser.add_argument("--weight-decay", type=float, default=float(_get_nested(cfg, "train", "weight_decay", default=1e-4)))
-    parser.add_argument("--grad-clip", type=float, default=float(_get_nested(cfg, "train", "grad_clip", default=1.0)))
-    parser.add_argument("--num-workers", type=int, default=int(_get_nested(cfg, "train", "num_workers", default=0)))
-
-    parser.add_argument("--hidden-dim", type=int, default=int(_get_nested(cfg, "model", "hidden_dim", default=128)))
-    parser.add_argument("--time-dim", type=int, default=int(_get_nested(cfg, "model", "time_dim", default=64)))
-    parser.add_argument("--num-layers", type=int, default=int(_get_nested(cfg, "model", "num_layers", default=3)))
-    parser.add_argument("--num-heads", type=int, default=int(_get_nested(cfg, "model", "num_heads", default=8)))
-    parser.add_argument("--dropout", type=float, default=float(_get_nested(cfg, "model", "dropout", default=0.0)))
-    parser.add_argument("--ffn-mult", type=int, default=int(_get_nested(cfg, "model", "ffn_mult", default=4)))
-    parser.add_argument(
-        "--use-radius-condition",
-        dest="use_radius_condition",
-        action="store_true",
-        default=bool(_get_nested(cfg, "model", "use_radius_condition", default=False)),
-    )
-    parser.add_argument("--no-radius-condition", dest="use_radius_condition", action="store_false")
-
-    parser.add_argument("--physics-weight", type=float, default=float(_get_nested(cfg, "loss", "physics_weight", default=0.1)))
-    parser.add_argument("--gravity-weight", type=float, default=float(_get_nested(cfg, "loss", "gravity_weight", default=0.1)))
-    parser.add_argument("--ground-weight", type=float, default=float(_get_nested(cfg, "loss", "ground_weight", default=0.1)))
-    parser.add_argument("--collision-weight", type=float, default=float(_get_nested(cfg, "loss", "collision_weight", default=0.3)))
-    parser.add_argument("--collision-alpha", type=float, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--collision-epsilon", type=float, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--collision-constant", type=float, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--y-ground", type=float, default=float(_get_nested(cfg, "loss", "y_ground", default=0.0)))
-    parser.add_argument("--unroll-steps", type=int, default=int(_get_nested(cfg, "loss", "unroll_steps", default=4)))
-    parser.add_argument(
-        "--unroll-curriculum-epochs",
-        type=int,
-        default=int(_get_nested(cfg, "loss", "unroll_curriculum_epochs", default=0)),
-    )
-
-    parser.add_argument("--seed", type=int, default=int(_get_nested(cfg, "runtime", "seed", default=42)))
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=str(_get_nested(cfg, "runtime", "device", default="auto")),
-        choices=["auto", "cpu", "cuda"],
-    )
-    parser.add_argument("--outdir", type=str, default=str(_get_nested(cfg, "runtime", "outdir", default="runs")))
-    parser.add_argument("--run-name", type=str, default=str(_get_nested(cfg, "runtime", "run_name", default="")))
-    return parser.parse_args(remaining)
+def get(cfg: dict[str, Any], section: str, key: str, default: Any) -> Any:
+    return cfg.get(section, {}).get(key, default)
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+def resolve_device(name: str) -> torch.device:
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if name == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but not available.")
+    return torch.device(name)
 
 
-def resolve_device(device_arg: str) -> torch.device:
-    if device_arg == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA requested but not available.")
-        return torch.device("cuda")
-    if device_arg == "cpu":
-        return torch.device("cpu")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def mean_metrics(metrics: Iterable[Dict[str, float]]) -> Dict[str, float]:
-    metrics = list(metrics)
-    if not metrics:
-        return {}
-    sums: Dict[str, float] = {}
-    for row in metrics:
-        for key, value in row.items():
-            sums[key] = sums.get(key, 0.0) + float(value)
-    n = float(len(metrics))
-    return {key: value / n for key, value in sums.items()}
-
-
-def get_unroll_steps(epoch: int, max_steps: int, curriculum_epochs: int) -> int:
-    if max_steps < 1:
-        raise ValueError(f"unroll_steps must be >= 1, got {max_steps}")
-    if curriculum_epochs <= 0 or max_steps == 1:
-        return max_steps
-    progress = min(1.0, max(epoch, 1) / float(curriculum_epochs))
-    return min(max_steps, max(1, int(1 + progress * (max_steps - 1))))
+def mean(rows: list[dict[str, float]]) -> dict[str, float]:
+    return {key: sum(row[key] for row in rows) / len(rows) for key in rows[0]}
 
 
 def run_epoch(
     model: torch.nn.Module,
-    criterion: CombinedLoss,
+    loss_fn: ProjectionFlowLoss,
     loader: DataLoader,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
     grad_clip: float = 0.0,
-) -> Dict[str, float]:
-    is_train = optimizer is not None
-    model.train(is_train)
-    rows: list[Dict[str, float]] = []
+) -> dict[str, float]:
+    model.train(optimizer is not None)
+    rows: list[dict[str, float]] = []
+    context = torch.enable_grad() if optimizer is not None else torch.no_grad()
 
-    context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
         for batch in loader:
-            x1 = batch["state"].to(device)
-            r = batch["radius"].to(device)
-            x0 = batch["state_init"].to(device)
+            source = batch["source"].to(device)
+            target = batch["target"].to(device)
+            condition = batch["condition"].to(device)
+            radius = batch["radius"].to(device)
 
-            if is_train:
+            if optimizer is not None:
                 optimizer.zero_grad(set_to_none=True)
 
-            loss, metrics = criterion(model, x0, x1, r)
+            loss, metrics = loss_fn(model, source, target, radius, condition)
 
-            if is_train:
+            if optimizer is not None:
                 loss.backward()
                 if grad_clip > 0.0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -171,154 +75,85 @@ def run_epoch(
 
             rows.append(metrics)
 
-    return mean_metrics(rows)
+    return mean(rows)
 
 
 def main() -> None:
-    args = parse_args()
-    if args.unroll_steps < 1:
-        raise ValueError(f"unroll_steps must be >= 1, got {args.unroll_steps}")
-    set_seed(args.seed)
-    device = resolve_device(args.device)
+    parser = argparse.ArgumentParser(description="Train projection flow model.")
+    parser.add_argument("--config", default="configs/train.yaml")
+    args = parser.parse_args()
+    cfg = load_config(args.config)
 
-    run_name = args.run_name or datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_dir = Path(args.outdir) / run_name
+    seed = int(get(cfg, "runtime", "seed", 42))
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+    device = resolve_device(str(get(cfg, "runtime", "device", "auto")))
+    run_name = str(get(cfg, "runtime", "run_name", "")) or datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = Path(str(get(cfg, "runtime", "outdir", "runs"))) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    train_ds = RelaxedCirclesDataset(
-        dataset_path=args.dataset,
-        split=args.train_split,
-        use_relaxed_state=True,
-        return_init_state=True,
-    )
-    val_ds = RelaxedCirclesDataset(
-        dataset_path=args.dataset,
-        split=args.val_split,
-        use_relaxed_state=True,
-        return_init_state=True,
-    )
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        drop_last=False,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        drop_last=False,
-    )
+    dataset_path = str(get(cfg, "data", "dataset", "data/box2d_projection.pt"))
+    train_ds = ProjectionTransitionDataset(dataset_path, split=str(get(cfg, "data", "train_split", "train")))
+    val_ds = ProjectionTransitionDataset(dataset_path, split=str(get(cfg, "data", "val_split", "val")))
+    batch_size = int(get(cfg, "train", "batch_size", 128))
+    num_workers = int(get(cfg, "train", "num_workers", 0))
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     model_kwargs = {
-        "hidden_dim": args.hidden_dim,
-        "time_dim": args.time_dim,
-        "num_layers": args.num_layers,
-        "num_heads": args.num_heads,
-        "dropout": args.dropout,
-        "ffn_mult": args.ffn_mult,
-        "use_radius_condition": args.use_radius_condition,
+        "hidden_dim": int(get(cfg, "model", "hidden_dim", 128)),
+        "time_dim": int(get(cfg, "model", "time_dim", 64)),
+        "num_layers": int(get(cfg, "model", "num_layers", 3)),
     }
     loss_kwargs = {
-        "physics_weight": args.physics_weight,
-        "gravity_weight": args.gravity_weight,
-        "ground_weight": args.ground_weight,
-        "collision_weight": args.collision_weight,
-        "y_ground": args.y_ground,
-        "unroll_steps": args.unroll_steps,
+        "physics_weight": float(get(cfg, "loss", "physics_weight", 0.1)),
+        "ground_weight": float(get(cfg, "loss", "ground_weight", 0.1)),
+        "collision_weight": float(get(cfg, "loss", "collision_weight", 0.3)),
+        "y_ground": float(get(cfg, "loss", "y_ground", 0.0)),
+        "unroll_steps": int(get(cfg, "loss", "unroll_steps", 4)),
     }
-
     model = FlowVelocityNet(**model_kwargs).to(device)
-    criterion = CombinedLoss(**loss_kwargs).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    loss_fn = ProjectionFlowLoss(**loss_kwargs).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(get(cfg, "train", "lr", 1e-3)),
+        weight_decay=float(get(cfg, "train", "weight_decay", 1e-4)),
+    )
 
     best_val = float("inf")
-    history: list[Dict[str, float]] = []
+    history: list[dict[str, float]] = []
+    epochs = int(get(cfg, "train", "epochs", 30))
+    grad_clip = float(get(cfg, "train", "grad_clip", 1.0))
+    print(f"Training on {device}, dataset={dataset_path}, run_dir={run_dir}")
 
-    print(f"Training on device={device}, run_dir={run_dir}")
-    print(
-        f"Dataset={args.dataset}, train_split={args.train_split}, val_split={args.val_split}, "
-        "path=state_init->state_relaxed"
-    )
-    for epoch in range(1, args.epochs + 1):
-        unroll_steps = get_unroll_steps(
-            epoch=epoch,
-            max_steps=args.unroll_steps,
-            curriculum_epochs=args.unroll_curriculum_epochs,
-        )
-        criterion.set_unroll_steps(unroll_steps)
-        train_metrics = run_epoch(
-            model=model,
-            criterion=criterion,
-            loader=train_loader,
-            device=device,
-            optimizer=optimizer,
-            grad_clip=args.grad_clip,
-        )
-        val_metrics = run_epoch(
-            model=model,
-            criterion=criterion,
-            loader=val_loader,
-            device=device,
-            optimizer=None,
-        )
-
-        train_loss = train_metrics.get("loss", float("nan"))
-        val_loss = val_metrics.get("loss", float("nan"))
-        history.append(
-            {
-                "epoch": float(epoch),
-                "unroll_steps": float(unroll_steps),
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-            }
-        )
-        checkpoint_loss_kwargs = {**loss_kwargs, "unroll_steps": unroll_steps}
+    for epoch in range(1, epochs + 1):
+        train_metrics = run_epoch(model, loss_fn, train_loader, device, optimizer, grad_clip)
+        val_metrics = run_epoch(model, loss_fn, val_loader, device)
+        row = {"epoch": float(epoch), "train_loss": train_metrics["loss"], "val_loss": val_metrics["loss"]}
+        history.append(row)
 
         checkpoint = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "model_kwargs": model_kwargs,
-            "loss_kwargs": checkpoint_loss_kwargs,
-            "train_args": vars(args),
-            "train_metrics": train_metrics,
-            "val_metrics": val_metrics,
+            "loss_kwargs": loss_kwargs,
+            "config": cfg,
         }
         torch.save(checkpoint, run_dir / "last.pt")
-        if val_loss < best_val:
-            best_val = val_loss
+        if val_metrics["loss"] < best_val:
+            best_val = val_metrics["loss"]
             torch.save(checkpoint, run_dir / "best.pt")
 
         print(
-            f"[{epoch:03d}/{args.epochs:03d}] "
-            f"train_loss={train_loss:.6f} val_loss={val_loss:.6f} "
-            f"unroll={unroll_steps} "
-            f"fm={val_metrics.get('fm', float('nan')):.6f} "
-            f"physics={val_metrics.get('physics', float('nan')):.6f} "
-            f"res/fm={val_metrics.get('physics_residual_over_fm', float('nan')):.6f}"
+            f"[{epoch:03d}/{epochs:03d}] "
+            f"train={train_metrics['loss']:.6f} val={val_metrics['loss']:.6f} "
+            f"fm={val_metrics['fm']:.6f} physics={val_metrics['physics']:.6f}"
         )
 
     with (run_dir / "summary.json").open("w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "best_val_loss": best_val,
-                "history": history,
-                "model_kwargs": model_kwargs,
-                "loss_kwargs": loss_kwargs,
-                "train_args": vars(args),
-            },
-            f,
-            indent=2,
-        )
-
-    print(f"Done. Best val loss: {best_val:.6f}")
-    print(f"Saved checkpoints: {run_dir / 'best.pt'} and {run_dir / 'last.pt'}")
+        json.dump({"best_val_loss": best_val, "history": history, "config": cfg}, f, indent=2)
 
 
 if __name__ == "__main__":

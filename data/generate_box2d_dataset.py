@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import argparse
 import random
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import torch
-import yaml
+
+try:
+    import yaml
+except ModuleNotFoundError:
+    yaml = None
 
 try:
     from data.box2d_render import render_split_samples
@@ -15,345 +18,151 @@ except ModuleNotFoundError:
     from box2d_render import render_split_samples
 
 SPLITS = ("train", "val", "test")
-META_KEYS = (
-    "seed",
-    "num_objects",
-    "radius_min",
-    "radius_max",
-    "xy_limit",
-    "y_ground",
-    "wall_thickness",
-    "spawn_padding",
-    "spawn_y_min_ratio",
-    "spawn_y_max_ratio",
-    "max_placement_tries",
-    "gravity_y",
-    "density",
-    "friction",
-    "restitution",
-    "linear_damping",
-    "angular_damping",
-    "time_step",
-    "velocity_iters",
-    "position_iters",
-    "max_steps",
-    "min_steps_before_check",
-    "sleep_window",
-    "linear_velocity_eps",
-    "angular_velocity_eps",
-    "require_settled",
-    "max_resample_attempts",
-)
 
 
 class SpawnPlacementError(RuntimeError):
     pass
 
 
-def _load_yaml_config(config_path: str) -> dict[str, Any]:
-    if not config_path:
-        return {}
-    path = Path(config_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {path}")
-    with path.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    if not isinstance(data, dict):
-        raise ValueError(f"Config root must be a mapping, got {type(data)!r}")
-    return data
+def load_config(path: str) -> dict[str, Any]:
+    if yaml is None:
+        raise RuntimeError("PyYAML is required. Install requirements.txt first.")
+    with Path(path).open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
 
-def _get_nested(config: Mapping[str, Any], *keys: str, default: Any) -> Any:
-    cur: Any = config
-    for key in keys:
-        if not isinstance(cur, Mapping) or key not in cur:
-            return default
-        cur = cur[key]
-    return cur
-
-
-def _cfg_default(cfg: Mapping[str, Any], section: str, key: str, default: Any, cast: Any) -> Any:
-    return cast(_get_nested(cfg, section, key, default=default))
+def get(cfg: dict[str, Any], section: str, key: str, default: Any) -> Any:
+    return cfg.get(section, {}).get(key, default)
 
 
 def parse_args() -> argparse.Namespace:
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--config", type=str, default="")
-    pre_args, remaining = pre.parse_known_args()
-    cfg = _load_yaml_config(pre_args.config)
-    default_render_dir = (
-        str(_get_nested(cfg, "render", "dir", default="")) if bool(_get_nested(cfg, "render", "enabled", default=False)) else ""
+    parser = argparse.ArgumentParser(description="Generate Box2D projection transition dataset.")
+    parser.add_argument("--config", default="configs/dataset_box2d.yaml")
+    cli = parser.parse_args()
+    cfg = load_config(cli.config)
+    render_enabled = bool(get(cfg, "render", "enabled", False))
+
+    return argparse.Namespace(
+        config=cli.config,
+        output=str(get(cfg, "dataset", "output", "data/box2d_projection.pt")),
+        train_samples=int(get(cfg, "dataset", "train_samples", 8192)),
+        val_samples=int(get(cfg, "dataset", "val_samples", 2048)),
+        test_samples=int(get(cfg, "dataset", "test_samples", 2048)),
+        num_objects=int(get(cfg, "dataset", "num_objects", 8)),
+        radius_min=float(get(cfg, "dataset", "radius_min", 0.05)),
+        radius_max=float(get(cfg, "dataset", "radius_max", 0.15)),
+        transitions_per_world=int(get(cfg, "dataset", "transitions_per_world", 64)),
+        xy_limit=float(get(cfg, "layout", "xy_limit", 1.0)),
+        y_ground=float(get(cfg, "layout", "y_ground", 0.0)),
+        wall_thickness=float(get(cfg, "layout", "wall_thickness", 0.08)),
+        spawn_padding=float(get(cfg, "layout", "spawn_padding", 0.01)),
+        spawn_y_min_ratio=float(get(cfg, "layout", "spawn_y_min_ratio", 0.35)),
+        spawn_y_max_ratio=float(get(cfg, "layout", "spawn_y_max_ratio", 0.95)),
+        max_placement_tries=int(get(cfg, "layout", "max_placement_tries", 128)),
+        gravity_y=float(get(cfg, "box2d", "gravity_y", -9.8)),
+        density=float(get(cfg, "box2d", "density", 1.0)),
+        friction=float(get(cfg, "box2d", "friction", 0.4)),
+        restitution=float(get(cfg, "box2d", "restitution", 0.0)),
+        linear_damping=float(get(cfg, "box2d", "linear_damping", 0.1)),
+        angular_damping=float(get(cfg, "box2d", "angular_damping", 0.1)),
+        time_step=float(get(cfg, "box2d", "time_step", 1.0 / 60.0)),
+        velocity_iters=int(get(cfg, "box2d", "velocity_iters", 8)),
+        position_iters=int(get(cfg, "box2d", "position_iters", 3)),
+        max_steps=int(get(cfg, "box2d", "max_steps", 1200)),
+        min_steps_before_check=int(get(cfg, "box2d", "min_steps_before_check", 240)),
+        sleep_window=int(get(cfg, "box2d", "sleep_window", 90)),
+        linear_velocity_eps=float(get(cfg, "box2d", "linear_velocity_eps", 0.03)),
+        angular_velocity_eps=float(get(cfg, "box2d", "angular_velocity_eps", 0.05)),
+        seed=int(get(cfg, "runtime", "seed", 42)),
+        require_settled=bool(get(cfg, "runtime", "require_settled", True)),
+        max_resample_attempts=int(get(cfg, "runtime", "max_resample_attempts", 8)),
+        render_dir=str(get(cfg, "render", "dir", "")) if render_enabled else "",
+        render_split=str(get(cfg, "render", "split", "train")),
+        render_count=int(get(cfg, "render", "count", 6)),
+        render_size=int(get(cfg, "render", "size", 1024)),
     )
 
-    parser = argparse.ArgumentParser(
-        description="Generate settled circle states using Box2D inside a fixed layout and save dataset splits."
-    )
-    parser.add_argument("--config", type=str, default=pre_args.config)
-    scalar_args = [
-        ("--output", str, "dataset", "output", "data/box2d_circles.pt"),
-        ("--train-samples", int, "dataset", "train_samples", 8192),
-        ("--val-samples", int, "dataset", "val_samples", 2048),
-        ("--test-samples", int, "dataset", "test_samples", 2048),
-        ("--num-objects", int, "dataset", "num_objects", 8),
-        ("--radius-min", float, "dataset", "radius_min", 0.05),
-        ("--radius-max", float, "dataset", "radius_max", 0.15),
-        ("--xy-limit", float, "layout", "xy_limit", 1.0),
-        ("--y-ground", float, "layout", "y_ground", 0.0),
-        ("--wall-thickness", float, "layout", "wall_thickness", 0.08),
-        ("--spawn-padding", float, "layout", "spawn_padding", 0.01),
-        ("--spawn-y-min-ratio", float, "layout", "spawn_y_min_ratio", 0.35),
-        ("--spawn-y-max-ratio", float, "layout", "spawn_y_max_ratio", 0.95),
-        ("--max-placement-tries", int, "layout", "max_placement_tries", 128),
-        ("--gravity-y", float, "box2d", "gravity_y", -9.8),
-        ("--density", float, "box2d", "density", 1.0),
-        ("--friction", float, "box2d", "friction", 0.4),
-        ("--restitution", float, "box2d", "restitution", 0.0),
-        ("--linear-damping", float, "box2d", "linear_damping", 0.1),
-        ("--angular-damping", float, "box2d", "angular_damping", 0.1),
-        ("--time-step", float, "box2d", "time_step", 1.0 / 60.0),
-        ("--velocity-iters", int, "box2d", "velocity_iters", 8),
-        ("--position-iters", int, "box2d", "position_iters", 3),
-        ("--max-steps", int, "box2d", "max_steps", 1200),
-        ("--min-steps-before-check", int, "box2d", "min_steps_before_check", 240),
-        ("--sleep-window", int, "box2d", "sleep_window", 90),
-        ("--linear-velocity-eps", float, "box2d", "linear_velocity_eps", 0.03),
-        ("--angular-velocity-eps", float, "box2d", "angular_velocity_eps", 0.05),
-        ("--seed", int, "runtime", "seed", 42),
-        ("--render-count", int, "render", "count", 6),
-        ("--render-size", int, "render", "size", 1024),
-        ("--max-resample-attempts", int, "runtime", "max_resample_attempts", 8),
-        ("--support-check-eps", float, "runtime", "support_check_eps", 0.02),
-    ]
-    for flag, cast, section, key, default in scalar_args:
-        parser.add_argument(flag, type=cast, default=_cfg_default(cfg, section, key, default, cast))
 
-    parser.add_argument("--render-dir", type=str, default=default_render_dir)
-    parser.add_argument(
-        "--render-split",
-        type=str,
-        default=_cfg_default(cfg, "render", "split", "train", str),
-        choices=SPLITS,
-    )
-    parser.add_argument(
-        "--require-settled",
-        dest="require_settled",
-        action="store_true",
-        default=bool(_get_nested(cfg, "runtime", "require_settled", default=True)),
-    )
-    parser.add_argument("--allow-unsettled", dest="require_settled", action="store_false")
-    return parser.parse_args(remaining)
-
-
-def load_box2d() -> tuple[Any, Any, Any, float]:
+def load_box2d() -> tuple[Any, Any, Any]:
     try:
-        from Box2D import b2CircleShape, b2PolygonShape, b2World, b2_linearSlop
+        from Box2D import b2CircleShape, b2PolygonShape, b2World
     except Exception as exc:
-        raise RuntimeError(
-            "Box2D import failed. Install a compatible package first, e.g. `pip install Box2D`."
-        ) from exc
-    return b2World, b2CircleShape, b2PolygonShape, float(b2_linearSlop)
+        raise RuntimeError("Box2D import failed. Install requirements.txt first.") from exc
+    return b2World, b2CircleShape, b2PolygonShape
 
 
-def make_radius_batch(
-    num_samples: int,
-    num_objects: int,
-    radius_min: float,
-    radius_max: float,
-    seed: int,
-) -> torch.Tensor:
-    g = torch.Generator().manual_seed(seed)
-    radius = torch.empty(num_samples, num_objects, dtype=torch.float32).uniform_(
-        radius_min, radius_max, generator=g
-    )
-    return radius.contiguous()
-
-
-def _make_world(
-    b2_world_ctor: Any,
-    b2_polygon_shape_ctor: Any,
-    gravity_y: float,
-    xy_limit: float,
-    y_ground: float,
-    wall_thickness: float,
-) -> Any:
-    world = b2_world_ctor(gravity=(0.0, gravity_y), doSleep=True)
-
-    half_w = float(xy_limit) + float(wall_thickness)
-    half_t = float(wall_thickness) * 0.5
-    wall_h = float(xy_limit) + float(wall_thickness)
-    half_wall_h = wall_h * 0.5
-    y_mid = float(y_ground) + wall_h * 0.5
+def make_world(args: argparse.Namespace, b2_world_ctor: Any, b2_polygon_shape_ctor: Any) -> Any:
+    world = b2_world_ctor(gravity=(0.0, args.gravity_y), doSleep=True)
+    half_w = args.xy_limit + args.wall_thickness
+    half_t = args.wall_thickness * 0.5
+    wall_h = args.xy_limit + args.wall_thickness
+    y_mid = args.y_ground + wall_h * 0.5
 
     world.CreateStaticBody(
-        position=(0.0, float(y_ground) - half_t),
+        position=(0.0, args.y_ground - half_t),
         shapes=b2_polygon_shape_ctor(box=(half_w, half_t)),
     )
     world.CreateStaticBody(
-        position=(-float(xy_limit) - half_t, y_mid),
-        shapes=b2_polygon_shape_ctor(box=(half_t, half_wall_h)),
+        position=(-args.xy_limit - half_t, y_mid),
+        shapes=b2_polygon_shape_ctor(box=(half_t, wall_h * 0.5)),
     )
     world.CreateStaticBody(
-        position=(float(xy_limit) + half_t, y_mid),
-        shapes=b2_polygon_shape_ctor(box=(half_t, half_wall_h)),
+        position=(args.xy_limit + half_t, y_mid),
+        shapes=b2_polygon_shape_ctor(box=(half_t, wall_h * 0.5)),
     )
     return world
 
 
-def _sample_spawn_points(
-    rng: random.Random,
-    radius: torch.Tensor,
-    num_objects: int,
-    xy_limit: float,
-    y_ground: float,
-    spawn_padding: float,
-    spawn_y_min_ratio: float,
-    spawn_y_max_ratio: float,
-    max_placement_tries: int,
-) -> list[tuple[float, float]]:
-    placements: list[tuple[float, float] | None] = [None] * num_objects
-    placed_indices: list[int] = []
+def sample_radius(args: argparse.Namespace, generator: torch.Generator) -> torch.Tensor:
+    return torch.empty(args.num_objects, dtype=torch.float32).uniform_(
+        args.radius_min,
+        args.radius_max,
+        generator=generator,
+    )
 
-    order = sorted(range(num_objects), key=lambda idx: float(radius[idx].item()), reverse=True)
+
+def sample_spawn_points(args: argparse.Namespace, radius: torch.Tensor, rng: random.Random) -> list[tuple[float, float]]:
+    placements: list[tuple[float, float] | None] = [None] * args.num_objects
+    placed: list[int] = []
+    order = sorted(range(args.num_objects), key=lambda idx: float(radius[idx]), reverse=True)
+
     for i in order:
-        ri = float(radius[i].item())
-        x_min = -xy_limit + ri + spawn_padding
-        x_max = xy_limit - ri - spawn_padding
-        y_min = y_ground + max(spawn_y_min_ratio * xy_limit, ri + spawn_padding)
-        y_max = y_ground + min(spawn_y_max_ratio * xy_limit, xy_limit - ri - spawn_padding)
+        ri = float(radius[i])
+        x_min = -args.xy_limit + ri + args.spawn_padding
+        x_max = args.xy_limit - ri - args.spawn_padding
+        y_min = args.y_ground + max(args.spawn_y_min_ratio * args.xy_limit, ri + args.spawn_padding)
+        y_max = args.y_ground + min(args.spawn_y_max_ratio * args.xy_limit, args.xy_limit - ri - args.spawn_padding)
         if x_min >= x_max or y_min >= y_max:
-            raise ValueError("Spawn area is invalid. Adjust layout or radius constraints.")
-        placed = False
-        for _ in range(max_placement_tries):
+            raise ValueError("Spawn area is invalid.")
+
+        for _ in range(args.max_placement_tries):
             x = rng.uniform(x_min, x_max)
             y = rng.uniform(y_min, y_max)
-            valid = True
-            for j in placed_indices:
-                placed_point = placements[j]
-                if placed_point is None:
-                    raise RuntimeError("Internal error: placed index missing spawn point.")
-                px, py = placed_point
-                rj = float(radius[j].item())
-                dx = x - px
-                dy = y - py
-                if (dx * dx + dy * dy) < (ri + rj + spawn_padding) ** 2:
-                    valid = False
-                    break
-            if valid:
+            ok = True
+            for j in placed:
+                px, py = placements[j]
+                min_dist = ri + float(radius[j]) + args.spawn_padding
+                ok = ok and (x - px) ** 2 + (y - py) ** 2 >= min_dist**2
+            if ok:
                 placements[i] = (x, y)
-                placed_indices.append(i)
-                placed = True
+                placed.append(i)
                 break
 
-        if not placed:
-            raise SpawnPlacementError(
-                "Failed to place non-overlapping initial circles. "
-                "Increase max_placement_tries / max_resample_attempts or loosen the layout."
-            )
+        if placements[i] is None:
+            raise SpawnPlacementError("Failed to place non-overlapping circles.")
 
-    result: list[tuple[float, float]] = []
-    for point in placements:
-        if point is None:
-            raise RuntimeError("Internal error: incomplete spawn placement.")
-        result.append((float(point[0]), float(point[1])))
-    return result
+    return [point for point in placements if point is not None]
 
 
-def _clamp_state_in_layout_inplace(
-    state: torch.Tensor,
-    radius: torch.Tensor,
-    xy_limit: float,
-    y_ground: float,
-) -> None:
-    x_min = -xy_limit + radius
-    x_max = xy_limit - radius
-    y_min = y_ground + radius
-    y_max = y_ground + xy_limit - radius
-    state[:, 0] = torch.maximum(torch.minimum(state[:, 0], x_max), x_min)
-    state[:, 1] = torch.maximum(torch.minimum(state[:, 1], y_max), y_min)
-
-
-def _is_supported_configuration(
-    state: torch.Tensor,
-    radius: torch.Tensor,
-    xy_limit: float,
-    y_ground: float,
-    eps: float,
-) -> bool:
-    num_objects = int(state.size(0))
-    if num_objects <= 0:
-        return True
-
-    seeds: set[int] = set()
-    adjacency: list[set[int]] = [set() for _ in range(num_objects)]
-
-    for i in range(num_objects):
-        x = float(state[i, 0].item())
-        y = float(state[i, 1].item())
-        ri = float(radius[i].item())
-        on_ground = abs(y - (y_ground + ri)) <= eps
-        on_left = abs(x - (-xy_limit + ri)) <= eps
-        on_right = abs(x - (xy_limit - ri)) <= eps
-        if on_ground or on_left or on_right:
-            seeds.add(i)
-
-    if not seeds:
-        return False
-
-    for i in range(num_objects - 1):
-        for j in range(i + 1, num_objects):
-            dist = float(torch.linalg.norm(state[i] - state[j]).item())
-            target = float((radius[i] + radius[j]).item())
-            if abs(dist - target) <= eps:
-                adjacency[i].add(j)
-                adjacency[j].add(i)
-
-    frontier = list(seeds)
-    seen = set(seeds)
-    while frontier:
-        cur = frontier.pop()
-        for nxt in adjacency[cur]:
-            if nxt in seen:
-                continue
-            seen.add(nxt)
-            frontier.append(nxt)
-    return len(seen) == num_objects
-
-
-def simulate_one_sample(
-    radius: torch.Tensor,
-    seed: int,
+def create_bodies(
     args: argparse.Namespace,
-    b2_world_ctor: Any,
+    world: Any,
     b2_circle_shape_ctor: Any,
-    b2_polygon_shape_ctor: Any,
-    support_check_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, int, int]:
-    rng = random.Random(seed)
-    world = _make_world(
-        b2_world_ctor=b2_world_ctor,
-        b2_polygon_shape_ctor=b2_polygon_shape_ctor,
-        gravity_y=args.gravity_y,
-        xy_limit=args.xy_limit,
-        y_ground=args.y_ground,
-        wall_thickness=args.wall_thickness,
-    )
-    spawn_points = _sample_spawn_points(
-        rng=rng,
-        radius=radius,
-        num_objects=args.num_objects,
-        xy_limit=args.xy_limit,
-        y_ground=args.y_ground,
-        spawn_padding=args.spawn_padding,
-        spawn_y_min_ratio=args.spawn_y_min_ratio,
-        spawn_y_max_ratio=args.spawn_y_max_ratio,
-        max_placement_tries=args.max_placement_tries,
-    )
-
-    bodies: list[Any] = []
-    state_init = torch.zeros(args.num_objects, 2, dtype=torch.float32)
-    for i in range(args.num_objects):
-        ri = float(radius[i].item())
-        x, y = spawn_points[i]
+    radius: torch.Tensor,
+    spawn_points: list[tuple[float, float]],
+) -> list[Any]:
+    bodies = []
+    for i, (x, y) in enumerate(spawn_points):
         body = world.CreateDynamicBody(
             position=(x, y),
             angle=0.0,
@@ -362,162 +171,162 @@ def simulate_one_sample(
             allowSleep=True,
         )
         body.CreateFixture(
-            shape=b2_circle_shape_ctor(radius=ri),
+            shape=b2_circle_shape_ctor(radius=float(radius[i])),
             density=args.density,
             friction=args.friction,
             restitution=args.restitution,
         )
         bodies.append(body)
-        state_init[i, 0] = x
-        state_init[i, 1] = y
+    return bodies
 
+
+def read_state(bodies: list[Any]) -> torch.Tensor:
+    state = torch.zeros(len(bodies), 4, dtype=torch.float32)
+    for i, body in enumerate(bodies):
+        state[i, 0] = float(body.position.x)
+        state[i, 1] = float(body.position.y)
+        state[i, 2] = float(body.linearVelocity.x)
+        state[i, 3] = float(body.linearVelocity.y)
+    return state
+
+
+def explicit_proposal(state: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
+    dt = args.time_step
+    proposal = state.clone()
+    velocity = state[:, 2:] + state.new_tensor([0.0, args.gravity_y]) * dt
+    if args.linear_damping > 0.0:
+        velocity = velocity / (1.0 + args.linear_damping * dt)
+    proposal[:, 2:] = velocity
+    proposal[:, :2] = state[:, :2] + velocity * dt
+    return proposal
+
+
+def simulate_episode(
+    args: argparse.Namespace,
+    radius: torch.Tensor,
+    seed: int,
+    b2_world_ctor: Any,
+    b2_circle_shape_ctor: Any,
+    b2_polygon_shape_ctor: Any,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    rng = random.Random(seed)
+    world = make_world(args, b2_world_ctor, b2_polygon_shape_ctor)
+    spawn_points = sample_spawn_points(args, radius, rng)
+    bodies = create_bodies(args, world, b2_circle_shape_ctor, radius, spawn_points)
+
+    conditions = []
+    sources = []
+    targets = []
     stable_count = 0
-    settle_step = args.max_steps
+    settled = False
+
     for step in range(args.max_steps):
+        condition = read_state(bodies)
+        source = explicit_proposal(condition, args)
         world.Step(args.time_step, args.velocity_iters, args.position_iters)
+        target = read_state(bodies)
 
-        max_lin = 0.0
-        max_ang = 0.0
-        for body in bodies:
-            lin = float(body.linearVelocity.length)
-            ang = abs(float(body.angularVelocity))
-            if lin > max_lin:
-                max_lin = lin
-            if ang > max_ang:
-                max_ang = ang
+        conditions.append(condition)
+        sources.append(source)
+        targets.append(target)
 
-        if (step + 1) < args.min_steps_before_check:
-            stable_count = 0
+        max_lin = max(float(body.linearVelocity.length) for body in bodies)
+        max_ang = max(abs(float(body.angularVelocity)) for body in bodies)
+        if step + 1 < args.min_steps_before_check:
             continue
-
-        if max_lin <= args.linear_velocity_eps and max_ang <= args.angular_velocity_eps:
-            stable_count += 1
-        else:
-            stable_count = 0
-
+        stable_count = stable_count + 1 if max_lin <= args.linear_velocity_eps and max_ang <= args.angular_velocity_eps else 0
         if stable_count >= args.sleep_window:
-            settle_step = step + 1
+            settled = True
             break
 
-    state_relaxed = torch.zeros(args.num_objects, 2, dtype=torch.float32)
-    for i, body in enumerate(bodies):
-        state_relaxed[i, 0] = float(body.position.x)
-        state_relaxed[i, 1] = float(body.position.y)
+    return torch.stack(sources), torch.stack(targets), torch.stack(conditions), settled
 
-    _clamp_state_in_layout_inplace(
-        state=state_relaxed,
-        radius=radius,
-        xy_limit=args.xy_limit,
-        y_ground=args.y_ground,
-    )
 
-    supported = _is_supported_configuration(
-        state=state_relaxed,
-        radius=radius,
-        xy_limit=args.xy_limit,
-        y_ground=args.y_ground,
-        eps=support_check_eps,
-    )
-    settled = 1 if (settle_step < args.max_steps and supported) else 0
-    return state_init, state_relaxed, settle_step, settled
+def select_transition_indices(length: int, max_count: int) -> torch.Tensor:
+    if max_count < 1:
+        raise ValueError("transitions_per_world must be >= 1.")
+    if length <= max_count:
+        return torch.arange(length)
+    return torch.linspace(0, length - 1, steps=max_count).round().long().unique()
 
 
 def generate_split(
-    split_name: str,
-    num_samples: int,
+    split: str,
+    num_transitions: int,
     split_seed: int,
     args: argparse.Namespace,
     b2_world_ctor: Any,
     b2_circle_shape_ctor: Any,
     b2_polygon_shape_ctor: Any,
-    support_check_eps: float,
 ) -> dict[str, torch.Tensor]:
-    radius = make_radius_batch(
-        num_samples=num_samples,
-        num_objects=args.num_objects,
-        radius_min=args.radius_min,
-        radius_max=args.radius_max,
-        seed=split_seed,
-    )
+    radius_generator = torch.Generator().manual_seed(split_seed)
+    source_chunks = []
+    target_chunks = []
+    condition_chunks = []
+    radius_chunks = []
+    world_idx = 0
+    total = 0
+    log_next = max(1, num_transitions // 10)
 
-    init_states: list[torch.Tensor] = []
-    relaxed_states: list[torch.Tensor] = []
-    settle_steps = torch.zeros(num_samples, dtype=torch.int32)
-    settled_flags = torch.zeros(num_samples, dtype=torch.int32)
-    resample_attempts = torch.zeros(num_samples, dtype=torch.int32)
-
-    log_every = max(1, num_samples // 10)
-    for idx in range(num_samples):
-        s_init = torch.zeros(args.num_objects, 2, dtype=torch.float32)
-        s_relaxed = torch.zeros(args.num_objects, 2, dtype=torch.float32)
-        settle_step = args.max_steps
-        settled = 0
-        used_attempt = 0
+    while total < num_transitions:
+        radius = sample_radius(args, radius_generator)
         last_error: Exception | None = None
+        episode = None
 
         for attempt in range(args.max_resample_attempts + 1):
-            sample_seed = split_seed + idx * 9973 + attempt * 104729
+            seed = split_seed + world_idx * 9973 + attempt * 104729
             try:
-                s_init, s_relaxed, settle_step, settled = simulate_one_sample(
-                    radius=radius[idx],
-                    seed=sample_seed,
-                    args=args,
-                    b2_world_ctor=b2_world_ctor,
-                    b2_circle_shape_ctor=b2_circle_shape_ctor,
-                    b2_polygon_shape_ctor=b2_polygon_shape_ctor,
-                    support_check_eps=support_check_eps,
+                source, target, condition, settled = simulate_episode(
+                    args,
+                    radius,
+                    seed,
+                    b2_world_ctor,
+                    b2_circle_shape_ctor,
+                    b2_polygon_shape_ctor,
                 )
-                last_error = None
             except SpawnPlacementError as exc:
                 last_error = exc
                 continue
-            used_attempt = attempt
-            if settled:
+            if settled or not args.require_settled:
+                episode = (source, target, condition)
                 break
 
-        if args.require_settled and not settled:
-            extra = f" Last error: {last_error}" if last_error is not None else ""
-            raise RuntimeError(
-                f"[{split_name}] sample {idx} failed to settle after {args.max_resample_attempts + 1} attempts. "
-                "Increase max_steps, loosen stability thresholds, or raise max_resample_attempts."
-                f"{extra}"
-            )
+        if episode is None:
+            raise RuntimeError(f"[{split}] failed to generate a settled episode. Last error: {last_error}")
 
-        init_states.append(s_init)
-        relaxed_states.append(s_relaxed)
-        settle_steps[idx] = settle_step
-        settled_flags[idx] = settled
-        resample_attempts[idx] = used_attempt
+        source, target, condition = episode
+        selected = select_transition_indices(source.size(0), args.transitions_per_world)
+        take = min(num_transitions - total, selected.numel())
+        selected = selected[:take]
 
-        if (idx + 1) % log_every == 0 or (idx + 1) == num_samples:
-            print(f"[{split_name}] generated {idx + 1}/{num_samples}")
+        source_chunks.append(source[selected])
+        target_chunks.append(target[selected])
+        condition_chunks.append(condition[selected])
+        radius_chunks.append(radius.expand(take, -1).clone())
 
-    state_init = torch.stack(init_states, dim=0).contiguous()
-    state_relaxed = torch.stack(relaxed_states, dim=0).contiguous()
-    settled_ratio = float(settled_flags.float().mean().item())
-    mean_steps = float(settle_steps.float().mean().item())
-    mean_attempts = float(resample_attempts.float().mean().item())
-    print(
-        f"[{split_name}] samples={num_samples} settled_ratio={settled_ratio:.3f} "
-        f"mean_settle_steps={mean_steps:.1f} mean_resample_attempts={mean_attempts:.2f}"
-    )
+        total += take
+        world_idx += 1
+        if total >= log_next:
+            print(f"[{split}] generated {total}/{num_transitions} transitions from {world_idx} worlds")
+            log_next += max(1, num_transitions // 10)
 
     return {
-        "state_init": state_init,
-        "state_relaxed": state_relaxed,
-        "radius": radius,
-        "settle_steps": settle_steps,
-        "settled": settled_flags,
-        "resample_attempts": resample_attempts,
+        "source": torch.cat(source_chunks).contiguous(),
+        "target": torch.cat(target_chunks).contiguous(),
+        "condition": torch.cat(condition_chunks).contiguous(),
+        "radius": torch.cat(radius_chunks).contiguous(),
     }
 
 
-def _build_meta(args: argparse.Namespace, support_check_eps: float, box2d_linear_slop: float) -> dict[str, Any]:
-    meta = {"generator": "box2d_settle"}
-    meta.update({k: getattr(args, k) for k in META_KEYS})
-    meta["support_check_eps"] = support_check_eps
-    meta["box2d_linear_slop"] = float(box2d_linear_slop)
-    return meta
+def build_meta(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "generator": "box2d_projection_transition",
+        "state": "x,y,vx,vy",
+        "source": "explicit dynamics proposal before constraint solve",
+        "target": "Box2D next state after constraint solve",
+        "condition": "state before explicit dynamics",
+        **vars(args),
+    }
 
 
 def main() -> None:
@@ -525,43 +334,38 @@ def main() -> None:
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    b2_world_ctor, b2_circle_shape_ctor, b2_polygon_shape_ctor, box2d_linear_slop = load_box2d()
-    support_check_eps = max(float(args.support_check_eps), 2.0 * float(box2d_linear_slop))
+    b2_world_ctor, b2_circle_shape_ctor, b2_polygon_shape_ctor = load_box2d()
+    counts = {"train": args.train_samples, "val": args.val_samples, "test": args.test_samples}
+    offsets = {"train": 0, "val": 1, "test": 2}
+    splits = {
+        split: generate_split(
+            split,
+            counts[split],
+            args.seed + offsets[split],
+            args,
+            b2_world_ctor,
+            b2_circle_shape_ctor,
+            b2_polygon_shape_ctor,
+        )
+        for split in SPLITS
+    }
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    sample_counts = {"train": args.train_samples, "val": args.val_samples, "test": args.test_samples}
-    split_offsets = {"train": 0, "val": 1, "test": 2}
-    split_map: dict[str, dict[str, torch.Tensor]] = {}
-    for split_name in SPLITS:
-        split_map[split_name] = generate_split(
-            split_name=split_name,
-            num_samples=sample_counts[split_name],
-            split_seed=args.seed + split_offsets[split_name],
-            args=args,
-            b2_world_ctor=b2_world_ctor,
-            b2_circle_shape_ctor=b2_circle_shape_ctor,
-            b2_polygon_shape_ctor=b2_polygon_shape_ctor,
-            support_check_eps=support_check_eps,
-        )
-
-    payload = {"meta": _build_meta(args, support_check_eps, box2d_linear_slop), **split_map}
-    torch.save(payload, output_path)
+    torch.save({"meta": build_meta(args), **splits}, output_path)
     print(f"Saved dataset to {output_path}")
 
     if args.render_dir:
-        render_dir = Path(args.render_dir)
         render_split_samples(
-            split_data=split_map[args.render_split],
-            render_dir=render_dir,
-            split_name=args.render_split,
-            count=args.render_count,
-            xy_limit=args.xy_limit,
-            y_ground=args.y_ground,
-            image_size=args.render_size,
+            splits[args.render_split],
+            Path(args.render_dir),
+            args.render_split,
+            args.render_count,
+            args.xy_limit,
+            args.y_ground,
+            args.render_size,
         )
-        print(f"Saved renders to {render_dir}")
+        print(f"Saved renders to {args.render_dir}")
 
 
 if __name__ == "__main__":
