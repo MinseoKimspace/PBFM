@@ -10,20 +10,22 @@ class PhysicsEnergyLoss(nn.Module):
         ground_weight=0.1,
         collision_weight=0.3,
         y_ground=0.0,
+        slop=0.0,
     ):
         super().__init__()
         self.ground_weight = ground_weight
         self.collision_weight = collision_weight
         self.y_ground = y_ground
+        self.slop = slop
 
     def forward(self, pos: torch.Tensor, radius: torch.Tensor): # pos = (B, N, 2), radius = (B, N)
         y = pos[:, :, 1]
-        ground_loss = torch.mean(F.relu(radius - y + self.y_ground), dim=1)
+        ground_loss = torch.mean(F.relu(radius - y + self.y_ground - self.slop), dim=1)
         
         pairwise_distances = pos[:, :, None, :] - pos[:, None, :, :]
         pairwise_radius = radius[:, :, None] + radius[:, None, :]
         center_distance = torch.linalg.norm(pairwise_distances, dim=-1)
-        overlap = pairwise_radius - center_distance
+        overlap = pairwise_radius - center_distance - self.slop
         pair_mask = torch.triu(
             torch.ones(pos.size(1), pos.size(1), device=pos.device, dtype=torch.bool),
             diagonal=1,

@@ -52,6 +52,11 @@ def parse_args() -> argparse.Namespace:
         radius_min=float(get(cfg, "dataset", "radius_min", 0.05)),
         radius_max=float(get(cfg, "dataset", "radius_max", 0.15)),
         transitions_per_world=int(get(cfg, "dataset", "transitions_per_world", 64)),
+        dynamic_fraction=float(get(cfg, "dataset", "dynamic_fraction", 0.75)),
+        dynamic_score_threshold=float(get(cfg, "dataset", "dynamic_score_threshold", 0.05)),
+        contact_margin=float(get(cfg, "dataset", "contact_margin", 0.25)),
+        rollout_count=int(get(cfg, "dataset", "rollout_count", 0)),
+        rollout_steps=int(get(cfg, "dataset", "rollout_steps", 0)),
         xy_limit=float(get(cfg, "layout", "xy_limit", 1.0)),
         y_ground=float(get(cfg, "layout", "y_ground", 0.0)),
         wall_thickness=float(get(cfg, "layout", "wall_thickness", 0.08)),
@@ -61,10 +66,10 @@ def parse_args() -> argparse.Namespace:
         max_placement_tries=int(get(cfg, "layout", "max_placement_tries", 128)),
         gravity_y=float(get(cfg, "box2d", "gravity_y", -9.8)),
         density=float(get(cfg, "box2d", "density", 1.0)),
-        friction=float(get(cfg, "box2d", "friction", 0.4)),
+        friction=float(get(cfg, "box2d", "friction", 0.0)),
         restitution=float(get(cfg, "box2d", "restitution", 0.0)),
         linear_damping=float(get(cfg, "box2d", "linear_damping", 0.1)),
-        angular_damping=float(get(cfg, "box2d", "angular_damping", 0.1)),
+        angular_damping=float(get(cfg, "box2d", "angular_damping", 0.0)),
         time_step=float(get(cfg, "box2d", "time_step", 1.0 / 60.0)),
         velocity_iters=int(get(cfg, "box2d", "velocity_iters", 8)),
         position_iters=int(get(cfg, "box2d", "position_iters", 3)),
@@ -83,16 +88,18 @@ def parse_args() -> argparse.Namespace:
     )
 
 
-def load_box2d() -> tuple[Any, Any, Any]:
+def load_box2d() -> tuple[Any, Any, Any, float]:
     try:
-        from Box2D import b2CircleShape, b2PolygonShape, b2World
+        from Box2D import b2CircleShape, b2PolygonShape, b2World, b2_linearSlop
     except Exception as exc:
         raise RuntimeError("Box2D import failed. Install requirements.txt first.") from exc
-    return b2World, b2CircleShape, b2PolygonShape
+    return b2World, b2CircleShape, b2PolygonShape, float(b2_linearSlop)
 
 
 def make_world(args: argparse.Namespace, b2_world_ctor: Any, b2_polygon_shape_ctor: Any) -> Any:
-    world = b2_world_ctor(gravity=(0.0, args.gravity_y), doSleep=True)
+    world = b2_world_ctor(gravity=(0.0, args.gravity_y), doSleep=False)
+    if hasattr(world, "warmStarting"):
+        world.warmStarting = False
     half_w = args.xy_limit + args.wall_thickness
     half_t = args.wall_thickness * 0.5
     wall_h = args.xy_limit + args.wall_thickness
@@ -161,6 +168,9 @@ def create_bodies(
     radius: torch.Tensor,
     spawn_points: list[tuple[float, float]],
 ) -> list[Any]:
+    if abs(args.friction) > 1e-8:
+        raise ValueError("This minimal Markov dataset requires friction=0.0 because angular velocity is not in state.")
+
     bodies = []
     for i, (x, y) in enumerate(spawn_points):
         body = world.CreateDynamicBody(
@@ -168,7 +178,7 @@ def create_bodies(
             angle=0.0,
             linearDamping=args.linear_damping,
             angularDamping=args.angular_damping,
-            allowSleep=True,
+            allowSleep=False,
         )
         body.CreateFixture(
             shape=b2_circle_shape_ctor(radius=float(radius[i])),
@@ -228,12 +238,62 @@ def simulate_episode(
     return torch.stack(sources), torch.stack(targets), settled
 
 
-def select_transition_indices(length: int, max_count: int) -> torch.Tensor:
+def transition_scores(source: torch.Tensor, target: torch.Tensor, radius: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
+    pos = source[..., :2]
+    vel = source[..., 2:]
+    delta = target - source
+
+    speed = torch.linalg.norm(vel, dim=-1).amax(dim=1)
+    step_change = torch.linalg.norm(delta, dim=-1).amax(dim=1)
+    ground_gap = pos[..., 1] - radius.unsqueeze(0) - args.y_ground
+    ground_near = torch.relu(args.contact_margin - ground_gap).amax(dim=1)
+
+    pair_delta = pos[:, :, None, :] - pos[:, None, :, :]
+    pair_dist = torch.linalg.norm(pair_delta, dim=-1)
+    pair_radius = radius[None, :, None] + radius[None, None, :]
+    separation = pair_dist - pair_radius
+    pair_near = torch.relu(args.contact_margin - separation)
+    eye = torch.eye(source.size(1), dtype=torch.bool, device=source.device).unsqueeze(0)
+    pair_near = pair_near.masked_fill(eye, 0.0).amax(dim=(1, 2))
+
+    return speed + 5.0 * step_change + 2.0 * ground_near + 2.0 * pair_near
+
+
+def select_transition_indices(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    radius: torch.Tensor,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    max_count = args.transitions_per_world
+    length = source.size(0)
     if max_count < 1:
         raise ValueError("transitions_per_world must be >= 1.")
     if length <= max_count:
-        return torch.arange(length)
-    return torch.linspace(0, length - 1, steps=max_count).round().long().unique()
+        selected = torch.arange(length)
+        scores = transition_scores(source, target, radius, args)
+        return selected, scores, scores > args.dynamic_score_threshold
+
+    scores = transition_scores(source, target, radius, args)
+    dynamic_count = min(max_count, max(1, int(round(max_count * args.dynamic_fraction))))
+    ranked = torch.argsort(scores, descending=True)
+    selected = ranked[:dynamic_count]
+
+    rest_count = max_count - selected.numel()
+    if rest_count > 0:
+        uniform = torch.linspace(0, length - 1, steps=rest_count).round().long()
+        selected = torch.cat([selected, uniform]).unique()
+
+    if selected.numel() < max_count:
+        keep = torch.ones(length, dtype=torch.bool)
+        keep[selected] = False
+        fill = ranked[keep[ranked]][: max_count - selected.numel()]
+        selected = torch.cat([selected, fill])
+
+    selected = selected[:max_count].sort().values
+    selected_scores = scores[selected]
+    dynamic = selected_scores > args.dynamic_score_threshold
+    return selected, selected_scores, dynamic
 
 
 def generate_split(
@@ -249,6 +309,12 @@ def generate_split(
     source_chunks = []
     target_chunks = []
     radius_chunks = []
+    score_chunks = []
+    dynamic_chunks = []
+    rollout_initial_chunks = []
+    rollout_target_chunks = []
+    rollout_radius_chunks = []
+    rollout_length_chunks = []
     world_idx = 0
     total = 0
     log_next = max(1, num_transitions // 10)
@@ -280,13 +346,29 @@ def generate_split(
             raise RuntimeError(f"[{split}] failed to generate a settled episode. Last error: {last_error}")
 
         source, target = episode
-        selected = select_transition_indices(source.size(0), args.transitions_per_world)
+        if args.rollout_steps > 0 and len(rollout_initial_chunks) < args.rollout_count:
+            rollout_length = min(args.rollout_steps, target.size(0))
+            if rollout_length > 0:
+                rollout_target = target[:rollout_length]
+                if rollout_length < args.rollout_steps:
+                    pad = rollout_target[-1:].expand(args.rollout_steps - rollout_length, -1, -1)
+                    rollout_target = torch.cat([rollout_target, pad], dim=0)
+                rollout_initial_chunks.append(source[0].clone())
+                rollout_target_chunks.append(rollout_target.clone())
+                rollout_radius_chunks.append(radius.clone())
+                rollout_length_chunks.append(torch.tensor(rollout_length, dtype=torch.long))
+
+        selected, selected_scores, dynamic = select_transition_indices(source, target, radius, args)
         take = min(num_transitions - total, selected.numel())
         selected = selected[:take]
+        selected_scores = selected_scores[:take]
+        dynamic = dynamic[:take]
 
         source_chunks.append(source[selected])
         target_chunks.append(target[selected])
         radius_chunks.append(radius.expand(take, -1).clone())
+        score_chunks.append(selected_scores)
+        dynamic_chunks.append(dynamic)
 
         total += take
         world_idx += 1
@@ -294,19 +376,41 @@ def generate_split(
             print(f"[{split}] generated {total}/{num_transitions} transitions from {world_idx} worlds")
             log_next += max(1, num_transitions // 10)
 
-    return {
+    split_data = {
         "source": torch.cat(source_chunks).contiguous(),
         "target": torch.cat(target_chunks).contiguous(),
         "radius": torch.cat(radius_chunks).contiguous(),
+        "score": torch.cat(score_chunks).float().contiguous(),
+        "dynamic": torch.cat(dynamic_chunks).bool().contiguous(),
     }
+    if rollout_initial_chunks:
+        split_data.update(
+            {
+                "rollout_initial": torch.stack(rollout_initial_chunks).contiguous(),
+                "rollout_target": torch.stack(rollout_target_chunks).contiguous(),
+                "rollout_radius": torch.stack(rollout_radius_chunks).contiguous(),
+                "rollout_length": torch.stack(rollout_length_chunks).contiguous(),
+            }
+        )
+    return split_data
 
 
-def build_meta(args: argparse.Namespace) -> dict[str, Any]:
+def delta_stats(split: dict[str, torch.Tensor]) -> tuple[list[float], list[float]]:
+    delta = (split["target"] - split["source"]).reshape(-1, 4)
+    mean = delta.mean(dim=0)
+    std = delta.std(dim=0).clamp_min(1e-6)
+    return mean.tolist(), std.tolist()
+
+
+def build_meta(args: argparse.Namespace, box2d_linear_slop: float, delta_mean: list[float], delta_std: list[float]) -> dict[str, Any]:
     return {
         "generator": "box2d_next_step",
         "state": "x,y,vx,vy",
         "source": "state before Box2D step",
         "target": "state after Box2D step",
+        "box2d_linear_slop": box2d_linear_slop,
+        "delta_mean": delta_mean,
+        "delta_std": delta_std,
         **vars(args),
     }
 
@@ -316,9 +420,9 @@ def main() -> None:
     random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    b2_world_ctor, b2_circle_shape_ctor, b2_polygon_shape_ctor = load_box2d()
+    b2_world_ctor, b2_circle_shape_ctor, b2_polygon_shape_ctor, box2d_linear_slop = load_box2d()
     counts = {"train": args.train_samples, "val": args.val_samples, "test": args.test_samples}
-    offsets = {"train": 0, "val": 1, "test": 2}
+    offsets = {"train": 0, "val": 1_000_000, "test": 2_000_000}
     splits = {
         split: generate_split(
             split,
@@ -334,7 +438,8 @@ def main() -> None:
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"meta": build_meta(args), **splits}, output_path)
+    delta_mean, delta_std = delta_stats(splits["train"])
+    torch.save({"meta": build_meta(args, box2d_linear_slop, delta_mean, delta_std), **splits}, output_path)
     print(f"Saved dataset to {output_path}")
 
     if args.render_dir:

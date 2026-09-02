@@ -4,6 +4,8 @@ eval:
   split: val
   batch_size: 4096
   num_workers: 8
+  ode_steps: 8
+  rollout_steps: 300
 
 runtime:
   device: cuda

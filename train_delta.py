@@ -11,8 +11,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from data.dataset import NextStepDataset
-from src.losses.combined import NextStepFlowLoss
-from src.models.network import FlowVelocityNet
+from src.losses.combined import DeltaLoss
+from src.models.network import DeltaVelocityNet
 
 try:
     import yaml
@@ -45,7 +45,7 @@ def mean(rows: list[dict[str, float]]) -> dict[str, float]:
 
 def run_epoch(
     model: torch.nn.Module,
-    loss_fn: NextStepFlowLoss,
+    loss_fn: DeltaLoss,
     loader: DataLoader,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
@@ -63,23 +63,20 @@ def run_epoch(
 
             if optimizer is not None:
                 optimizer.zero_grad(set_to_none=True)
-
             loss, metrics = loss_fn(model, source, target, radius)
-
             if optimizer is not None:
                 loss.backward()
                 if grad_clip > 0.0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
-
             rows.append(metrics)
 
     return mean(rows)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train next-step flow simulator.")
-    parser.add_argument("--config", default="configs/train.yaml")
+    parser = argparse.ArgumentParser(description="Train direct next-step delta baseline.")
+    parser.add_argument("--config", default="configs/train_delta.yaml")
     args = parser.parse_args()
     cfg = load_config(args.config)
 
@@ -88,7 +85,7 @@ def main() -> None:
     torch.manual_seed(seed)
 
     device = resolve_device(str(get(cfg, "runtime", "device", "auto")))
-    run_name = str(get(cfg, "runtime", "run_name", "")) or datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_name = str(get(cfg, "runtime", "run_name", "")) or datetime.now().strftime("%Y%m%d-%H%M%S_delta")
     run_dir = Path(str(get(cfg, "runtime", "outdir", "runs"))) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -102,25 +99,16 @@ def main() -> None:
 
     model_kwargs = {
         "hidden_dim": int(get(cfg, "model", "hidden_dim", 128)),
-        "time_dim": int(get(cfg, "model", "time_dim", 64)),
         "num_layers": int(get(cfg, "model", "num_layers", 3)),
         "message_steps": int(get(cfg, "model", "message_steps", 3)),
         "contact_margin": float(get(cfg, "model", "contact_margin", 0.25)),
     }
     loss_kwargs = {
-        "physics_weight": float(get(cfg, "loss", "physics_weight", 0.1)),
-        "ground_weight": float(get(cfg, "loss", "ground_weight", 0.1)),
-        "collision_weight": float(get(cfg, "loss", "collision_weight", 0.3)),
-        "y_ground": float(get(cfg, "loss", "y_ground", 0.0)),
-        "slop": float(get(cfg, "loss", "slop", train_ds.meta.get("box2d_linear_slop", 0.005))),
-        "unroll_steps": int(get(cfg, "loss", "unroll_steps", 4)),
-        "position_noise_std": float(get(cfg, "loss", "position_noise_std", 0.01)),
-        "velocity_noise_std": float(get(cfg, "loss", "velocity_noise_std", 0.05)),
         "delta_mean": train_ds.delta_mean.tolist(),
         "delta_std": train_ds.delta_std.tolist(),
     }
-    model = FlowVelocityNet(**model_kwargs).to(device)
-    loss_fn = NextStepFlowLoss(**loss_kwargs).to(device)
+    model = DeltaVelocityNet(**model_kwargs).to(device)
+    loss_fn = DeltaLoss(**loss_kwargs).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(get(cfg, "train", "lr", 1e-3)),
@@ -131,17 +119,16 @@ def main() -> None:
     history: list[dict[str, float]] = []
     epochs = int(get(cfg, "train", "epochs", 30))
     grad_clip = float(get(cfg, "train", "grad_clip", 1.0))
-    print(f"Training on {device}, dataset={dataset_path}, run_dir={run_dir}")
+    print(f"Training delta baseline on {device}, dataset={dataset_path}, run_dir={run_dir}")
 
     for epoch in range(1, epochs + 1):
         train_metrics = run_epoch(model, loss_fn, train_loader, device, optimizer, grad_clip)
         val_metrics = run_epoch(model, loss_fn, val_loader, device)
-        row = {"epoch": float(epoch), "train_loss": train_metrics["loss"], "val_loss": val_metrics["loss"]}
-        history.append(row)
+        history.append({"epoch": float(epoch), "train_loss": train_metrics["loss"], "val_loss": val_metrics["loss"]})
 
         checkpoint = {
             "epoch": epoch,
-            "model_type": "flow",
+            "model_type": "delta",
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "model_kwargs": model_kwargs,
@@ -153,11 +140,7 @@ def main() -> None:
             best_val = val_metrics["loss"]
             torch.save(checkpoint, run_dir / "best.pt")
 
-        print(
-            f"[{epoch:03d}/{epochs:03d}] "
-            f"train={train_metrics['loss']:.6f} val={val_metrics['loss']:.6f} "
-            f"fm={val_metrics['fm']:.6f} physics={val_metrics['physics']:.6f}"
-        )
+        print(f"[{epoch:03d}/{epochs:03d}] train={train_metrics['loss']:.6f} val={val_metrics['loss']:.6f}")
 
     with (run_dir / "summary.json").open("w", encoding="utf-8") as f:
         json.dump({"best_val_loss": best_val, "history": history, "config": cfg}, f, indent=2)

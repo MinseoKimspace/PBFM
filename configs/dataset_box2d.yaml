@@ -8,6 +8,11 @@ dataset:
   radius_min: 0.5
   radius_max: 1.5
   transitions_per_world: 128
+  dynamic_fraction: 0.75
+  dynamic_score_threshold: 0.05
+  contact_margin: 0.25
+  rollout_count: 64
+  rollout_steps: 300
 
 layout:
   xy_limit: 10.0
@@ -21,10 +26,10 @@ layout:
 box2d:
   gravity_y: -9.8
   density: 1.0
-  friction: 0.4
+  friction: 0.0
   restitution: 0.0
   linear_damping: 0.1
-  angular_damping: 0.1
+  angular_damping: 0.0
   time_step: 0.0166666667
   velocity_iters: 8
   position_iters: 3
