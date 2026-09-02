@@ -150,16 +150,14 @@ def render_one(
     canvas.save(output_path)
 
 
-def render_transition_panel(
-    condition: torch.Tensor,
-    source: torch.Tensor,
-    target: torch.Tensor,
+def render_state_panel(
+    states: list[torch.Tensor],
+    labels: list[str],
     radius: torch.Tensor,
     output_path: Path,
     xy_limit: float,
     y_ground: float,
     image_size: int,
-    labels: tuple[str, str, str] = ("condition", "proposal", "target"),
 ) -> None:
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -167,35 +165,21 @@ def render_transition_panel(
         print("PIL not available. Skipping render.")
         return
 
-    condition_pos = condition[..., :2]
-    source_pos = source[..., :2]
-    target_pos = target[..., :2]
-    panels = [
-        render_state_image(condition_pos, radius, xy_limit, y_ground, image_size),
-        render_state_image(
-            source_pos,
-            radius,
-            xy_limit,
-            y_ground,
-            image_size,
-            trajectory=torch.stack([condition_pos, source_pos], dim=0),
-        ),
-        render_state_image(
-            target_pos,
-            radius,
-            xy_limit,
-            y_ground,
-            image_size,
-            trajectory=torch.stack([source_pos, target_pos], dim=0),
-        ),
-    ]
+    positions = [state[..., :2] for state in states]
+    panels = []
+    for idx, pos in enumerate(positions):
+        trajectory = None
+        if idx > 0:
+            trajectory = torch.stack([positions[idx - 1], pos], dim=0)
+        panels.append(render_state_image(pos, radius, xy_limit, y_ground, image_size, trajectory=trajectory))
+
     if any(panel is None for panel in panels):
         print("PIL not available. Skipping render.")
         return
 
     panel_w, panel_h = panels[0].size
     caption_h = 32
-    canvas = Image.new("RGB", (panel_w * 3, panel_h + caption_h), (255, 255, 255))
+    canvas = Image.new("RGB", (panel_w * len(panels), panel_h + caption_h), (255, 255, 255))
     draw = ImageDraw.Draw(canvas)
     try:
         font = ImageFont.truetype("arial.ttf", 18)
@@ -213,6 +197,28 @@ def render_transition_panel(
     canvas.save(output_path)
 
 
+def render_transition_panel(
+    first: torch.Tensor,
+    second: torch.Tensor,
+    target: torch.Tensor,
+    radius: torch.Tensor,
+    output_path: Path,
+    xy_limit: float,
+    y_ground: float,
+    image_size: int,
+    labels: tuple[str, str, str] = ("source", "prediction", "target"),
+) -> None:
+    render_state_panel(
+        states=[first, second, target],
+        labels=list(labels),
+        radius=radius,
+        output_path=output_path,
+        xy_limit=xy_limit,
+        y_ground=y_ground,
+        image_size=image_size,
+    )
+
+
 def render_split_samples(
     split_data: dict[str, torch.Tensor],
     render_dir: Path,
@@ -224,10 +230,9 @@ def render_split_samples(
 ) -> None:
     num_total = split_data["source"].size(0)
     for idx in range(min(count, num_total)):
-        render_transition_panel(
-            condition=split_data["condition"][idx],
-            source=split_data["source"][idx],
-            target=split_data["target"][idx],
+        render_state_panel(
+            states=[split_data["source"][idx], split_data["target"][idx]],
+            labels=["source", "target"],
             radius=split_data["radius"][idx],
             output_path=render_dir / f"{split_name}_{idx:04d}_transition.png",
             xy_limit=xy_limit,

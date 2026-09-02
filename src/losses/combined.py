@@ -10,7 +10,7 @@ from src.losses.physics_energy import PhysicsEnergyLoss
 from src.paths.linear import sample_linear_path
 
 
-class ProjectionFlowLoss(nn.Module):
+class NextStepFlowLoss(nn.Module):
     def __init__(
         self,
         physics_weight: float = 0.1,
@@ -34,10 +34,9 @@ class ProjectionFlowLoss(nn.Module):
         source: torch.Tensor,
         target: torch.Tensor,
         radius: torch.Tensor,
-        condition: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         _, z_tau, tau, target_v = sample_linear_path(source, target)
-        v_hat = model(z_tau, tau, radius, condition)
+        v_hat = model(z_tau, tau, radius)
         fm_loss = F.mse_loss(v_hat, target_v)
 
         z = source
@@ -45,7 +44,7 @@ class ProjectionFlowLoss(nn.Module):
         dtau = 1.0 / float(self.unroll_steps)
         for step in range(self.unroll_steps):
             tau_mid = source.new_full((source.size(0), 1), (step + 0.5) * dtau)
-            z = z + dtau * model(z, tau_mid, radius, condition)
+            z = z + dtau * model(z, tau_mid, radius)
             physics_loss = physics_loss + self.physics(z[..., :2], radius).mean()
         physics_loss = physics_loss / float(self.unroll_steps)
 

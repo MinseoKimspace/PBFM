@@ -1,6 +1,6 @@
 # Config for data/generate_box2d_dataset.py
 dataset:
-  output: data/box2d_projection.pt
+  output: data/box2d_next_step.pt
   train_samples: 131072
   val_samples: 16384
   test_samples: 16384
@@ -41,7 +41,7 @@ runtime:
 
 render:
   enabled: true
-  dir: data/renders_projection
+  dir: data/renders_next_step
   split: train
   count: 6
   size: 1024

@@ -1,6 +1,6 @@
 # Config for train.py
 data:
-  dataset: data/box2d_projection.pt
+  dataset: data/box2d_next_step.pt
   train_split: train
   val_split: val
 

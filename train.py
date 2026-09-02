@@ -10,8 +10,8 @@ from typing import Any
 import torch
 from torch.utils.data import DataLoader
 
-from data.dataset import ProjectionTransitionDataset
-from src.losses.combined import ProjectionFlowLoss
+from data.dataset import NextStepDataset
+from src.losses.combined import NextStepFlowLoss
 from src.models.network import FlowVelocityNet
 
 try:
@@ -45,7 +45,7 @@ def mean(rows: list[dict[str, float]]) -> dict[str, float]:
 
 def run_epoch(
     model: torch.nn.Module,
-    loss_fn: ProjectionFlowLoss,
+    loss_fn: NextStepFlowLoss,
     loader: DataLoader,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None = None,
@@ -59,13 +59,12 @@ def run_epoch(
         for batch in loader:
             source = batch["source"].to(device)
             target = batch["target"].to(device)
-            condition = batch["condition"].to(device)
             radius = batch["radius"].to(device)
 
             if optimizer is not None:
                 optimizer.zero_grad(set_to_none=True)
 
-            loss, metrics = loss_fn(model, source, target, radius, condition)
+            loss, metrics = loss_fn(model, source, target, radius)
 
             if optimizer is not None:
                 loss.backward()
@@ -79,7 +78,7 @@ def run_epoch(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train projection flow model.")
+    parser = argparse.ArgumentParser(description="Train next-step flow simulator.")
     parser.add_argument("--config", default="configs/train.yaml")
     args = parser.parse_args()
     cfg = load_config(args.config)
@@ -93,9 +92,9 @@ def main() -> None:
     run_dir = Path(str(get(cfg, "runtime", "outdir", "runs"))) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset_path = str(get(cfg, "data", "dataset", "data/box2d_projection.pt"))
-    train_ds = ProjectionTransitionDataset(dataset_path, split=str(get(cfg, "data", "train_split", "train")))
-    val_ds = ProjectionTransitionDataset(dataset_path, split=str(get(cfg, "data", "val_split", "val")))
+    dataset_path = str(get(cfg, "data", "dataset", "data/box2d_next_step.pt"))
+    train_ds = NextStepDataset(dataset_path, split=str(get(cfg, "data", "train_split", "train")))
+    val_ds = NextStepDataset(dataset_path, split=str(get(cfg, "data", "val_split", "val")))
     batch_size = int(get(cfg, "train", "batch_size", 128))
     num_workers = int(get(cfg, "train", "num_workers", 0))
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
@@ -114,7 +113,7 @@ def main() -> None:
         "unroll_steps": int(get(cfg, "loss", "unroll_steps", 4)),
     }
     model = FlowVelocityNet(**model_kwargs).to(device)
-    loss_fn = ProjectionFlowLoss(**loss_kwargs).to(device)
+    loss_fn = NextStepFlowLoss(**loss_kwargs).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(get(cfg, "train", "lr", 1e-3)),

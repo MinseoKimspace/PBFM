@@ -8,9 +8,9 @@ from typing import Any
 import torch
 from torch.utils.data import DataLoader
 
-from data.dataset import ProjectionTransitionDataset
+from data.dataset import NextStepDataset
 from data.box2d_render import render_transition_panel
-from src.losses.combined import ProjectionFlowLoss
+from src.losses.combined import NextStepFlowLoss
 from src.models.network import FlowVelocityNet
 
 try:
@@ -42,20 +42,19 @@ def sample_flow(
     model: torch.nn.Module,
     source: torch.Tensor,
     radius: torch.Tensor,
-    condition: torch.Tensor,
     steps: int,
 ) -> torch.Tensor:
     z = source
     dtau = 1.0 / float(steps)
     for step in range(steps):
         tau = source.new_full((source.size(0), 1), (step + 0.5) * dtau)
-        z = z + dtau * model(z, tau, radius, condition)
+        z = z + dtau * model(z, tau, radius)
     return z
 
 
 def render_predictions(
     model: torch.nn.Module,
-    dataset: ProjectionTransitionDataset,
+    dataset: NextStepDataset,
     device: torch.device,
     render_dir: str,
     count: int,
@@ -71,24 +70,23 @@ def render_predictions(
             item = dataset[idx]
             source = item["source"].unsqueeze(0).to(device)
             target = item["target"].unsqueeze(0).to(device)
-            condition = item["condition"].unsqueeze(0).to(device)
             radius = item["radius"].unsqueeze(0).to(device)
-            prediction = sample_flow(model, source, radius, condition, sample_steps)
+            prediction = sample_flow(model, source, radius, sample_steps)
             render_transition_panel(
-                condition=source[0].cpu(),
-                source=prediction[0].cpu(),
+                first=source[0].cpu(),
+                second=prediction[0].cpu(),
                 target=target[0].cpu(),
                 radius=radius[0].cpu(),
                 output_path=out_dir / f"{idx:04d}_prediction.png",
                 xy_limit=xy_limit,
                 y_ground=y_ground,
                 image_size=image_size,
-                labels=("proposal", "prediction", "target"),
+                labels=("source", "prediction", "target"),
             )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate projection flow checkpoint.")
+    parser = argparse.ArgumentParser(description="Evaluate next-step flow checkpoint.")
     parser.add_argument("--config", default="configs/eval.yaml")
     args = parser.parse_args()
     cfg = load_config(args.config)
@@ -104,7 +102,7 @@ def main() -> None:
     split = str(get(cfg, "eval", "split", "val"))
     device = resolve_device(str(get(cfg, "runtime", "device", "auto")))
 
-    dataset = ProjectionTransitionDataset(dataset_path, split=split)
+    dataset = NextStepDataset(dataset_path, split=split)
     loader = DataLoader(
         dataset,
         batch_size=int(get(cfg, "eval", "batch_size", 256)),
@@ -114,7 +112,7 @@ def main() -> None:
 
     model = FlowVelocityNet(**checkpoint["model_kwargs"]).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
-    loss_fn = ProjectionFlowLoss(**checkpoint["loss_kwargs"]).to(device)
+    loss_fn = NextStepFlowLoss(**checkpoint["loss_kwargs"]).to(device)
     model.eval()
 
     totals: dict[str, float] = {}
@@ -122,9 +120,8 @@ def main() -> None:
         for batch in loader:
             source = batch["source"].to(device)
             target = batch["target"].to(device)
-            condition = batch["condition"].to(device)
             radius = batch["radius"].to(device)
-            _, metrics = loss_fn(model, source, target, radius, condition)
+            _, metrics = loss_fn(model, source, target, radius)
             for key, value in metrics.items():
                 totals[key] = totals.get(key, 0.0) + value
 

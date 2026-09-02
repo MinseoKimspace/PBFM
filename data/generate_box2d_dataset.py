@@ -36,7 +36,7 @@ def get(cfg: dict[str, Any], section: str, key: str, default: Any) -> Any:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate Box2D projection transition dataset.")
+    parser = argparse.ArgumentParser(description="Generate Box2D next-step dataset.")
     parser.add_argument("--config", default="configs/dataset_box2d.yaml")
     cli = parser.parse_args()
     cfg = load_config(cli.config)
@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
 
     return argparse.Namespace(
         config=cli.config,
-        output=str(get(cfg, "dataset", "output", "data/box2d_projection.pt")),
+        output=str(get(cfg, "dataset", "output", "data/box2d_next_step.pt")),
         train_samples=int(get(cfg, "dataset", "train_samples", 8192)),
         val_samples=int(get(cfg, "dataset", "val_samples", 2048)),
         test_samples=int(get(cfg, "dataset", "test_samples", 2048)),
@@ -190,17 +190,6 @@ def read_state(bodies: list[Any]) -> torch.Tensor:
     return state
 
 
-def explicit_proposal(state: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
-    dt = args.time_step
-    proposal = state.clone()
-    velocity = state[:, 2:] + state.new_tensor([0.0, args.gravity_y]) * dt
-    if args.linear_damping > 0.0:
-        velocity = velocity / (1.0 + args.linear_damping * dt)
-    proposal[:, 2:] = velocity
-    proposal[:, :2] = state[:, :2] + velocity * dt
-    return proposal
-
-
 def simulate_episode(
     args: argparse.Namespace,
     radius: torch.Tensor,
@@ -208,25 +197,22 @@ def simulate_episode(
     b2_world_ctor: Any,
     b2_circle_shape_ctor: Any,
     b2_polygon_shape_ctor: Any,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
     rng = random.Random(seed)
     world = make_world(args, b2_world_ctor, b2_polygon_shape_ctor)
     spawn_points = sample_spawn_points(args, radius, rng)
     bodies = create_bodies(args, world, b2_circle_shape_ctor, radius, spawn_points)
 
-    conditions = []
     sources = []
     targets = []
     stable_count = 0
     settled = False
 
     for step in range(args.max_steps):
-        condition = read_state(bodies)
-        source = explicit_proposal(condition, args)
+        source = read_state(bodies)
         world.Step(args.time_step, args.velocity_iters, args.position_iters)
         target = read_state(bodies)
 
-        conditions.append(condition)
         sources.append(source)
         targets.append(target)
 
@@ -239,7 +225,7 @@ def simulate_episode(
             settled = True
             break
 
-    return torch.stack(sources), torch.stack(targets), torch.stack(conditions), settled
+    return torch.stack(sources), torch.stack(targets), settled
 
 
 def select_transition_indices(length: int, max_count: int) -> torch.Tensor:
@@ -262,7 +248,6 @@ def generate_split(
     radius_generator = torch.Generator().manual_seed(split_seed)
     source_chunks = []
     target_chunks = []
-    condition_chunks = []
     radius_chunks = []
     world_idx = 0
     total = 0
@@ -276,7 +261,7 @@ def generate_split(
         for attempt in range(args.max_resample_attempts + 1):
             seed = split_seed + world_idx * 9973 + attempt * 104729
             try:
-                source, target, condition, settled = simulate_episode(
+                source, target, settled = simulate_episode(
                     args,
                     radius,
                     seed,
@@ -288,20 +273,19 @@ def generate_split(
                 last_error = exc
                 continue
             if settled or not args.require_settled:
-                episode = (source, target, condition)
+                episode = (source, target)
                 break
 
         if episode is None:
             raise RuntimeError(f"[{split}] failed to generate a settled episode. Last error: {last_error}")
 
-        source, target, condition = episode
+        source, target = episode
         selected = select_transition_indices(source.size(0), args.transitions_per_world)
         take = min(num_transitions - total, selected.numel())
         selected = selected[:take]
 
         source_chunks.append(source[selected])
         target_chunks.append(target[selected])
-        condition_chunks.append(condition[selected])
         radius_chunks.append(radius.expand(take, -1).clone())
 
         total += take
@@ -313,18 +297,16 @@ def generate_split(
     return {
         "source": torch.cat(source_chunks).contiguous(),
         "target": torch.cat(target_chunks).contiguous(),
-        "condition": torch.cat(condition_chunks).contiguous(),
         "radius": torch.cat(radius_chunks).contiguous(),
     }
 
 
 def build_meta(args: argparse.Namespace) -> dict[str, Any]:
     return {
-        "generator": "box2d_projection_transition",
+        "generator": "box2d_next_step",
         "state": "x,y,vx,vy",
-        "source": "explicit dynamics proposal before constraint solve",
-        "target": "Box2D next state after constraint solve",
-        "condition": "state before explicit dynamics",
+        "source": "state before Box2D step",
+        "target": "state after Box2D step",
         **vars(args),
     }
 
