@@ -1,0 +1,21 @@
+eval:
+  checkpoint: "runs/a6000_train/best.pt"
+  dataset: ""
+  split: val
+  batch_size: 512
+  num_workers: 8
+  solver_steps: [1, 4]
+  rollout_solver_steps: 4
+  rollout_steps: 300
+
+runtime:
+  device: cuda
+
+output:
+  json: ""
+
+render:
+  dir: ""
+  count: 8
+  size: 1024
+  solver_steps: 4

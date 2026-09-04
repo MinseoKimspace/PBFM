@@ -1,4 +1,4 @@
-# Config for train.py
+# Position-projection free vector-field FM.
 data:
   dataset: data/box2d_next_step.pt
   train_split: train
@@ -13,19 +13,27 @@ train:
   num_workers: 8
 
 model:
-  hidden_dim: 384
+  type: fm
+  hidden_dim: 256
   time_dim: 64
-  num_layers: 4
+  num_layers: 3
   message_steps: 4
   contact_margin: 0.25
 
+dynamics:
+  time_step: 0.0166666667
+  gravity_y: -9.8
+  linear_damping: 0.1
+
 loss:
-  physics_weight: 0.5
+  physics_weight: 0.1
   ground_weight: 1.0
   collision_weight: 1.0
   y_ground: 0.0
   slop: 0.005
-  unroll_steps: 8
+  contact_margin: 0.25
+  contact_loss_weight: 4.0
+  correction_threshold: 0.0001
   position_noise_std: 0.01
   velocity_noise_std: 0.05
 
@@ -33,4 +41,4 @@ runtime:
   seed: 42
   device: cuda
   outdir: runs
-  run_name: "a6000_train"
+  run_name: "projection_fm"
