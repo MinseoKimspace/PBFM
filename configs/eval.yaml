@@ -1,5 +1,5 @@
 eval:
-  checkpoint: ""
+  checkpoint: "runs/a6000_train/best.pt"
   dataset: ""
   split: val
   batch_size: 4096

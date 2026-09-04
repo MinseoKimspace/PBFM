@@ -34,7 +34,7 @@ loss:
   slop: 0.005
   contact_margin: 0.25
   contact_loss_weight: 4.0
-  correction_threshold: 0.0001
+  correction_threshold: 0.005
   position_noise_std: 0.01
   velocity_noise_std: 0.05
 
