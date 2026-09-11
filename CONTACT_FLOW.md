@@ -229,7 +229,7 @@ PBD는 sweep/contact evaluation 비용을 별도로 보고하며 NFE 1회와 swe
 필수: PyTorch, PyYAML, 렌더용 Pillow. 동일 구조의 JSON 설정도 지원합니다.
 
 ```powershell
-# 체크포인트/cache 없이 실행. 단일·3/5-stack·접촉 활성화 사례.
+# 체크포인트/cache 없이 실행. 단일·3/5/8/10-stack·접촉 활성화 사례.
 python eval_projection.py --config configs/eval_projection.yaml --preflight
 
 # gain/normalization/cap 및 경로 품질을 확인한 후 cache 생성.
@@ -245,6 +245,12 @@ cap [16,128]을 비교합니다. 무관한 baseline 축은 중복 실행하지 �
 고전 gradient/diagonal/Jacobi는 본래 수식을 유지하고 gain만 적용합니다.
 isotropic/inverse는 공통 normalized C 설정을 사용합니다.
 PBD는 별도의 sweep [4,16,64]로 비교합니다.
+
+preflight 렌더는 `renders/preflight/cases/<case>/`에 장면별로 저장합니다.
+각 PNG는 같은 확대 범위의 initial/final 패널이며, 흐린 점과 선은 solver 시작점과
+수용된 보정 경로, 색 십자는 최종 원 중심입니다. 헤더에는 tolerance PASS/MISS,
+최대 위반, NFE와 backtracking을 표시합니다. `sample_solvers/`는 별도로 생성한
+일반 평가 입력의 0번 장면만 보여 주므로 named physical-preflight 결과와 혼동하지 않습니다.
 
 ```powershell
 # 같은 field 구조의 energy-only objective 비교군.
@@ -287,6 +293,11 @@ v1의 약 28% 후보 성공은 모두 자유 낙하 유형에서 나왔고 stack
 - 기존 score는 성공 후보가 있어도 미수렴 후보를 선택하는 장면이 train20/val5개였습니다.
   terminal_violation_weight=.1에서 둘 다 0개로 줄었습니다.
 - T=1e-4 -> 3e-5로 낮추면 성공 경로 가중치가 커졌습니다.
+- 같은 기본 flow의 고정 수직 stack 확대 preflight에서는 3단과 5단은 tolerance를
+  만족했지만 8단과 10단은 unit solver time 안에 만족하지 못했습니다.
+  native PBD도 64 sweep에서 8단과 10단을 놓쳤습니다. 그래서 기본 학습의
+  `num_objects=5`는 아직 유지하며, 더 큰 학습 장면은 참조 solver의 scaling을
+  먼저 개선한 뒤 여는 것이 안전합니다.
 
 중요: 이 설정의 ESS는 어려운 장면에서 대체로 1에 가까워,
 **informed 후보를 중심으로 학습하는 성격이 강합니다.**

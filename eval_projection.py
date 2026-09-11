@@ -272,8 +272,8 @@ def rollout_metrics(state, radius, field_factory, physics, dynamics, solver, ste
             "initial_active_pair_count": gap_count}
 
 
-def _render(result, radius, path, physics, image_size=900):
-    from data.box2d_render import render_state_image
+def _render(result, radius, path, physics, image_size=900, proposal=None, title=None):
+    from data.box2d_render import render_projection_comparison
     history = result.get("history", {})
     final = result["final"][0]
     if not torch.isfinite(final).all():
@@ -284,18 +284,32 @@ def _render(result, radius, path, physics, image_size=900):
     else:
         points = final.new_empty(0, *final.shape)
     trajectory = torch.cat([points, final[None]], dim=0).cpu()
+    if proposal is None:
+        initial = trajectory[0] if len(trajectory) else final.cpu()
+    else:
+        initial = proposal[0].detach().cpu()
+    initial_violation = float(geometry(initial[None].double(), radius[:1].cpu().double(), physics)["max_violation"][0])
+    final_violation = float(geometry(final[None].double(), radius[:1].cpu().double(), physics)["max_violation"][0])
+    passed = bool(result["converged"][0]) and not bool(result["failed"][0])
+    status = "PASS" if passed else "MISS"
+    if "sweeps" in result:
+        cost = (f"sweeps={int(result['sweeps'][0])} | "
+                f"contact evals={int(result['contact_evals'][0])}")
+    else:
+        cost = (f"NFE={int(result['nfe'][0])} | "
+                f"backtracks={int(result['backtracks'][0])}")
     try:
-        canvas = render_state_image(final.cpu(), radius[0].cpu(), physics.xy_limit,
-                                    physics.y_ground, image_size, trajectory=trajectory)
+        rendered = render_projection_comparison(
+            initial, final.cpu(), radius[0].cpu(), path, physics.xy_limit,
+            physics.y_ground, image_size, trajectory=trajectory,
+            title=title or path.stem,
+            initial_label=f"initial\nmax violation={initial_violation:.6g}",
+            final_label=f"final  {status}\nmax violation={final_violation:.6g}\n{cost}")
     except (OverflowError, ValueError):
         # A diverged finite state may exceed Pillow's coordinate range.
         # Preserve the numerical failure report rather than crashing during rendering.
         return False
-    if canvas is None:
-        return False
-    path.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(path)
-    return True
+    return bool(rendered)
 
 
 def load_checkpoint(path, selected_device):
@@ -311,12 +325,18 @@ def load_checkpoint(path, selected_device):
 
 def physical_preflight(physics, solver, methods, selected_device, gains=(1, 4, 16, 64),
                        normalizations=("none", "diagonal"), flow=None, pbd_sweeps=(4, 16, 64),
-                       mobility_bounds=None):
+                       mobility_bounds=None, stack_sizes=(3, 5, 8, 10), render_dir=None,
+                       image_size=900):
     """Known small configurations, separate from random simulation starts."""
-    cases = {"single_ground_contact": [[0.0, 0.4]],
-             "fixed_normal_three_stack": [[0.0, 0.42], [0.0, 1.36], [0.0, 2.3]],
-             "fixed_normal_five_stack": [[0.0, 0.42 + 0.94 * i] for i in range(5)],
-             "changing_contact_chain": [[-0.4, 2.0], [0.4, 2.0], [1.42, 2.0]]}
+    names = {3: "three", 5: "five", 8: "eight", 10: "ten"}
+    stack_sizes = tuple(int(value) for value in stack_sizes)
+    if not stack_sizes or any(value < 2 or value > 64 for value in stack_sizes) or len(set(stack_sizes)) != len(stack_sizes):
+        raise ValueError("preflight stack_sizes must be unique integers in [2,64]")
+    cases = {"single_ground_contact": [[0.0, 0.4]]}
+    for size in stack_sizes:
+        label = names.get(size, str(size))
+        cases[f"fixed_normal_{label}_stack"] = [[0.0, 0.42 + 0.94 * i] for i in range(size)]
+    cases["changing_contact_chain"] = [[-0.4, 2.0], [0.4, 2.0], [1.42, 2.0]]
     if not gains or not normalizations or not pbd_sweeps:
         raise ValueError("Preflight gain, normalization and native PBD budgets must be nonempty")
     flow = flow or FlowConfig()
@@ -361,6 +381,18 @@ def physical_preflight(physics, solver, methods, selected_device, gains=(1, 4, 1
             metrics["max_sweeps"] = sweeps
             metrics["flow"] = asdict(settings) if settings else None
             metrics["comparison_scope"] = "native Gauss-Seidel PBD sweeps" if native else "fixed unit-time energy ODE"
+            canonical_flow = (native is None and settings is not None and
+                              float(settings.gain) == float(flow.gain) and
+                              (label.endswith("/classical") or
+                               (settings.normalization == flow.normalization and
+                                float(settings.mobility_bound) == float(flow.mobility_bound))))
+            canonical_pbd = native is not None and sweeps == max(pbd_sweeps)
+            if render_dir is not None and (canonical_flow or canonical_pbd):
+                safe_label = label.replace("/", "__")
+                path = Path(render_dir) / name / f"{safe_label}.png"
+                metrics["rendered"] = _render(result, radius, path, physics, image_size,
+                                              proposal=z, title=f"{name} | {label}")
+                metrics["rendered_path"] = str(path)
             report[f"{name}/{label}"] = metrics
     return report
 
@@ -492,6 +524,11 @@ def main():
               "rollout_steps": rollout_steps,
               "data_source": "procedural" if args.preflight or not ev.get("dataset") else ev["dataset"],
               "scene_types": scene_types,
+              "render_note": ("Preflight named cases are under render_dir/cases. "
+                              "Generic solver images under render_dir/sample_solvers show sample 0 only. "
+                              "Each image is a zoomed initial/final comparison; pale lines are solver trajectories, "
+                              "not deformed particle centers." if args.preflight else
+                              "Each image shows sample 0 as a zoomed initial/final comparison."),
               "linear_diagnostic": [fixed_contact_diagnostic(k, selected_device) for k in budgets],
               "note": "No Box2D endpoint MSE: the learned target is a contact-energy path. "
                       "Flow methods use fixed unit solver time, adaptive energy-decreasing Euler; native PBD uses contact sweeps. "
@@ -499,11 +536,14 @@ def main():
               "results": {}}
     if args.preflight:
         preflight = config.get("preflight", {})
+        stack_sizes = preflight.get("stack_sizes", [3, 5, 8, 10])
+        report["preflight_stack_sizes"] = [int(value) for value in stack_sizes]
         report["physical_preflight"] = physical_preflight(physics, replace(solver, steps=max(budgets)),
             methods, selected_device, gains=preflight.get("gains", [1, 4, 16, 64]),
             normalizations=preflight.get("normalizations", ["none", "diagonal"]), flow=flow,
             pbd_sweeps=preflight.get("pbd_sweeps", [4, 16, 64]),
-            mobility_bounds=preflight.get("mobility_bounds", [flow.mobility_bound]))
+            mobility_bounds=preflight.get("mobility_bounds", [flow.mobility_bound]),
+            stack_sizes=stack_sizes, render_dir=render_dir / "cases", image_size=image_size)
     path_cache = args.path_cache if args.path_cache is not None else ev.get("path_cache")
     if path_cache and not args.preflight:
         if any(name not in checkpoint for name in ("reference_cache_spec", "temperature", "weighting")):
@@ -518,7 +558,11 @@ def main():
             label = f"{name}_k{budget}"
             metrics, result = evaluate_projection(state, radius, factory, physics, dynamics, settings,
                                                    record=True, scene_types=scene_types)
-            metrics["rendered"] = _render(result, radius, render_dir / f"{label}.png", physics, image_size)
+            sample_dir = render_dir / "sample_solvers" if args.preflight else render_dir
+            proposal = free_position(state, **dynamics)
+            metrics["rendered"] = _render(
+                result, radius, sample_dir / f"{label}.png", physics, image_size,
+                proposal=proposal, title=f"sample 0 ({scene_types[0]}) | {label}")
             if rollout_steps:
                 take = min(rollout_count, state.shape[0])
                 metrics["rollout"] = rollout_metrics(state[:take], radius[:take], factory, physics, dynamics, settings, rollout_steps)
@@ -531,7 +575,11 @@ def main():
                                                record=True, projection_integrator=native, scene_types=scene_types)
         metrics["max_sweeps"] = sweep_budget
         metrics["completion_policy"] = "Finite completed sweep budget may miss tolerance; numerical failure stops a world."
-        metrics["rendered"] = _render(result, radius, render_dir / f"{label}.png", physics, image_size)
+        sample_dir = render_dir / "sample_solvers" if args.preflight else render_dir
+        proposal = free_position(state, **dynamics)
+        metrics["rendered"] = _render(
+            result, radius, sample_dir / f"{label}.png", physics, image_size,
+            proposal=proposal, title=f"sample 0 ({scene_types[0]}) | {label}")
         if rollout_steps:
             take = min(rollout_count, state.shape[0])
             metrics["rollout"] = rollout_metrics(state[:take], radius[:take], None, physics,

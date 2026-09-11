@@ -34,6 +34,7 @@ solver:
   tolerance: 0.001
   armijo: 0.0001
 preflight:
+  stack_sizes: [3, 5, 8, 10]     # Baseline-only scaling tests; does not change the trained model size.
   gains: [1.0, 4.0, 16.0, 32.0, 64.0]
   normalizations: [none, diagonal]
   mobility_bounds: [16.0, 128.0]

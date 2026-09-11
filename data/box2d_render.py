@@ -60,22 +60,34 @@ def render_state_image(
     vector_stride: int = 1,
     vector_scale: float = 1.0,
     vector_dt: float = 1.0,
+    view_bounds: tuple[float, float, float, float] | None = None,
+    canvas_size: tuple[int, int] | None = None,
+    show_centers: bool = False,
 ):
     try:
         from PIL import Image, ImageDraw
     except Exception:
         return None
 
-    world_x_min = -float(xy_limit)
-    world_x_max = float(xy_limit)
-    world_y_min = float(y_ground)
-    world_y_max = float(y_ground) + float(xy_limit)
+    if view_bounds is None:
+        world_x_min = -float(xy_limit)
+        world_x_max = float(xy_limit)
+        world_y_min = float(y_ground)
+        world_y_max = float(y_ground) + float(xy_limit)
+    else:
+        world_x_min, world_x_max, world_y_min, world_y_max = map(float, view_bounds)
+        if not (world_x_min < world_x_max and world_y_min < world_y_max):
+            raise ValueError("view_bounds must be (x_min, x_max, y_min, y_max) with positive extents")
     world_w = max(1e-6, world_x_max - world_x_min)
     world_h = max(1e-6, world_y_max - world_y_min)
 
     # Keep world-to-pixel scaling isotropic; otherwise vertical contacts look separated.
-    canvas_w = int(max(16, image_size))
-    canvas_h = int(max(16, round(canvas_w * (world_h / world_w))))
+    if canvas_size is None:
+        canvas_w = int(max(16, image_size))
+        canvas_h = int(max(16, round(canvas_w * (world_h / world_w))))
+    else:
+        canvas_w = int(max(16, canvas_size[0]))
+        canvas_h = int(max(16, canvas_size[1]))
     canvas = Image.new("RGB", (canvas_w, canvas_h), (255, 255, 255))
     draw = ImageDraw.Draw(canvas)
 
@@ -91,12 +103,18 @@ def render_state_image(
         y_px = y_offset + (world_y_max - y) * scale
         return x_px, y_px
 
-    x0, ground_line_y = to_px(world_x_min, world_y_min)
-    x1, _ = to_px(world_x_max, world_y_min)
-    _, y_top = to_px(world_x_min, world_y_max)
-    draw.line([(x0, y_top), (x0, ground_line_y)], fill=(0, 0, 0), width=2)
-    draw.line([(x1, y_top), (x1, ground_line_y)], fill=(0, 0, 0), width=2)
-    draw.line([(x0, ground_line_y), (x1, ground_line_y)], fill=(0, 0, 0), width=2)
+    if world_x_min <= -float(xy_limit) <= world_x_max:
+        x_wall, y_bottom = to_px(-float(xy_limit), world_y_min)
+        _, y_top = to_px(-float(xy_limit), world_y_max)
+        draw.line([(x_wall, y_top), (x_wall, y_bottom)], fill=(0, 0, 0), width=2)
+    if world_x_min <= float(xy_limit) <= world_x_max:
+        x_wall, y_bottom = to_px(float(xy_limit), world_y_min)
+        _, y_top = to_px(float(xy_limit), world_y_max)
+        draw.line([(x_wall, y_top), (x_wall, y_bottom)], fill=(0, 0, 0), width=2)
+    if world_y_min <= float(y_ground) <= world_y_max:
+        x0, ground_line_y = to_px(world_x_min, float(y_ground))
+        x1, _ = to_px(world_x_max, float(y_ground))
+        draw.line([(x0, ground_line_y), (x1, ground_line_y)], fill=(0, 0, 0), width=2)
 
     if trajectory is not None and trajectory.dim() == 3 and trajectory.size(1) == state.size(0):
         path_color_factor = 0.55
@@ -107,6 +125,8 @@ def render_state_image(
             points = [to_px(float(trajectory[s, i, 0]), float(trajectory[s, i, 1])) for s in range(trajectory.size(0))]
             if len(points) >= 2:
                 draw.line(points, fill=path_color, width=2)
+                sx, sy = points[0]
+                draw.ellipse((sx - 3, sy - 3, sx + 3, sy + 3), fill=path_color)
 
             if vector_field is None:
                 continue
@@ -124,7 +144,92 @@ def render_state_image(
         rr = float(radius[i]) * scale
         color = COLOR_CYCLE[i % len(COLOR_CYCLE)]
         draw.ellipse((cx - rr, cy - rr, cx + rr, cy + rr), outline=color, width=2)
+        if show_centers:
+            draw.line([(cx - 4, cy), (cx + 4, cy)], fill=color, width=2)
+            draw.line([(cx, cy - 4), (cx, cy + 4)], fill=color, width=2)
     return canvas
+
+
+def render_projection_comparison(
+    initial: torch.Tensor,
+    final: torch.Tensor,
+    radius: torch.Tensor,
+    output_path: Path,
+    xy_limit: float,
+    y_ground: float,
+    image_size: int,
+    trajectory: torch.Tensor | None = None,
+    title: str = "projection",
+    initial_label: str = "initial",
+    final_label: str = "final",
+) -> bool:
+    """Render a zoomed initial/final solver comparison with unambiguous centers.
+
+    A pale dot marks the trajectory start, the pale line is the accepted solver
+    path, and the colored cross is the final circle center.  Both panels share
+    one world-to-pixel scale so apparent displacement is directly comparable.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:
+        print("PIL not available. Skipping render.")
+        return False
+    if initial.shape != final.shape or initial.ndim != 2 or initial.shape[-1] != 2:
+        raise ValueError("initial and final must have matching [N,2] shapes")
+    if radius.shape != initial.shape[:1]:
+        raise ValueError("radius must have shape [N]")
+
+    samples = [initial, final]
+    if trajectory is not None and trajectory.ndim == 3 and trajectory.shape[1:] == initial.shape:
+        samples.append(trajectory.flatten(0, 1))
+    centers = torch.cat(samples, dim=0).detach().cpu().double()
+    radii = radius.detach().cpu().double()
+    max_radius = max(float(radii.max()), 1e-3)
+    particle_radii = radii.repeat(len(centers) // len(radii))
+    x_min = float((centers[:, 0] - particle_radii).min())
+    x_max = float((centers[:, 0] + particle_radii).max())
+    y_min = float((centers[:, 1] - particle_radii).min())
+    y_max = float((centers[:, 1] + particle_radii).max())
+    margin = max(0.25, 0.6 * max_radius)
+    if y_min <= y_ground + max(0.25, max_radius):
+        y_min = min(y_min, float(y_ground))
+    bounds = (x_min - margin, x_max + margin, y_min - margin, y_max + margin)
+    view_w, view_h = bounds[1] - bounds[0], bounds[3] - bounds[2]
+
+    total_width = int(max(480, image_size))
+    panel_width = total_width // 2
+    panel_height = int(max(300, min(max(480, image_size), round(panel_width * view_h / view_w))))
+    panel_size = (panel_width, panel_height)
+    first = render_state_image(initial.detach().cpu(), radii, xy_limit, y_ground, panel_width,
+                               view_bounds=bounds, canvas_size=panel_size, show_centers=True)
+    second = render_state_image(final.detach().cpu(), radii, xy_limit, y_ground, panel_width,
+                                trajectory=None if trajectory is None else trajectory.detach().cpu(),
+                                view_bounds=bounds, canvas_size=panel_size, show_centers=True)
+    if first is None or second is None:
+        return False
+
+    header_h, footer_h = 88, 42
+    canvas = Image.new("RGB", (panel_width * 2, panel_height + header_h + footer_h), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+    try:
+        title_font = ImageFont.truetype("arial.ttf", 17)
+        label_font = ImageFont.truetype("arial.ttf", 14)
+    except Exception:
+        title_font = label_font = ImageFont.load_default()
+    canvas.paste(first, (0, header_h))
+    canvas.paste(second, (panel_width, header_h))
+    draw.line([(panel_width, header_h), (panel_width, header_h + panel_height)], fill=(190, 190, 190), width=1)
+    draw.text((8, 5), title, fill=(0, 0, 0), font=title_font)
+    draw.multiline_text((8, 29), initial_label, fill=(0, 0, 0), font=label_font, spacing=1)
+    draw.multiline_text((panel_width + 8, 29), final_label, fill=(0, 0, 0), font=label_font, spacing=1)
+    footer_y = header_h + panel_height + 4
+    draw.text((8, footer_y), "pale dot/line: solver path start/trajectory",
+              fill=(70, 70, 70), font=label_font)
+    draw.text((8, footer_y + 17), "colored cross: final center",
+              fill=(70, 70, 70), font=label_font)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output_path)
+    return True
 
 
 def render_one(

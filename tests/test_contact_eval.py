@@ -157,7 +157,8 @@ class ContactEvaluationTests(unittest.TestCase):
             self.assertEqual(report["render_size"], 321)
             self.assertEqual(report["format"], "contact_flow_eval_v2")
             self.assertEqual(report["start_noise_std"], 0.0)
-            self.assertEqual(render.call_args.args[2], base / "pictures" / "preflight" / "inverse_k4.png")
+            self.assertEqual(render.call_args.args[2], base / "pictures" / "preflight" /
+                             "sample_solvers" / "inverse_k4.png")
             self.assertEqual(render.call_args.args[4], 321)
 
     def test_cli_energy_checkpoint_uses_saved_nondefault_dynamics(self):
@@ -220,7 +221,9 @@ class ContactEvaluationTests(unittest.TestCase):
     def test_preflight_sweeps_gain_normalization_and_native_pbd(self):
         report = evaluation.physical_preflight(self.physics, self.solver, ["isotropic"],
             torch.device("cpu"), gains=[1, 4], normalizations=["none", "diagonal"], pbd_sweeps=[1, 4])
-        self.assertEqual(len(report), 4 * (2 * 2 + 2))
+        self.assertEqual(len(report), 6 * (2 * 2 + 2))
+        self.assertIn("fixed_normal_eight_stack/isotropic/gain4/diagonal/cap16", report)
+        self.assertIn("fixed_normal_ten_stack/isotropic/gain4/diagonal/cap16", report)
         low = report["single_ground_contact/isotropic/gain1/diagonal/cap16"]
         high = report["single_ground_contact/isotropic/gain4/diagonal/cap16"]
         self.assertLess(high["max_violation"], low["max_violation"])
@@ -248,12 +251,15 @@ class ContactEvaluationTests(unittest.TestCase):
         report = evaluation.physical_preflight(self.physics, self.solver, ["gradient", "jacobi"],
             torch.device("cpu"), gains=[1, 4], normalizations=["none", "diagonal"],
             pbd_sweeps=[1], mobility_bounds=[16, 128])
-        self.assertEqual(len(report), 4 * (2 * 2 + 1))
+        self.assertEqual(len(report), 6 * (2 * 2 + 1))
         self.assertIn("fixed_normal_five_stack/gradient/gain4/classical", report)
         self.assertFalse(any("cap" in key for key in report))
         with self.assertRaisesRegex(ValueError, "mobility_bounds"):
             evaluation.physical_preflight(self.physics, self.solver, ["inverse"],
                 torch.device("cpu"), mobility_bounds=[])
+        with self.assertRaisesRegex(ValueError, "stack_sizes"):
+            evaluation.physical_preflight(self.physics, self.solver, ["inverse"],
+                torch.device("cpu"), stack_sizes=[5, 5])
 
     def test_one_step_initial_contact_groups_and_scene_labels(self):
         state, radius = self.state.repeat(2, 1, 1), self.radius.repeat(2, 1)
@@ -397,12 +403,21 @@ class ContactEvaluationTests(unittest.TestCase):
                 evaluation.main()
             result = json.loads((base / "eval_preflight.json").read_text(encoding="utf-8"))
             self.assertEqual(result["flow"]["gain"], 4)
-            self.assertEqual(len(result["physical_preflight"]), 36)
+            self.assertEqual(len(result["physical_preflight"]), 54)
+            self.assertEqual(result["preflight_stack_sizes"], [3, 5, 8, 10])
             self.assertIn("fixed_normal_five_stack/isotropic/gain4/diagonal/cap128",
+                          result["physical_preflight"])
+            self.assertIn("fixed_normal_ten_stack/isotropic/gain4/diagonal/cap128",
                           result["physical_preflight"])
             self.assertIn("pbd_sweeps1", result["results"])
             self.assertEqual(result["results"]["pbd_sweeps1"]["field_evaluations"], 0)
-            self.assertTrue((base / "renders" / "preflight" / "pbd_sweeps1.png").is_file())
+            self.assertTrue((base / "renders" / "preflight" / "sample_solvers" /
+                             "pbd_sweeps1.png").is_file())
+            self.assertTrue((base / "renders" / "preflight" / "cases" /
+                             "single_ground_contact" /
+                             "isotropic__gain4__diagonal__cap16.png").is_file())
+            self.assertTrue((base / "renders" / "preflight" / "cases" /
+                             "fixed_normal_ten_stack" / "pbd__sweeps1.png").is_file())
             self.assertEqual(result["scene_types"], ["vertical_stack"])
             self.assertIn("vertical_stack", result["results"]["pbd_sweeps1"]
                           ["convergence_breakdown"]["scene_types"])
