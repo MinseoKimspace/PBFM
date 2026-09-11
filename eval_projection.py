@@ -278,6 +278,8 @@ def _render(result, radius, path, physics, image_size=900, proposal=None, title=
     final = result["final"][0]
     if not torch.isfinite(final).all():
         return False
+    final_cpu = final.detach().cpu()
+    radius_cpu = radius[0].detach().cpu()
     if history and history["z"].shape[0]:
         valid = history["dt"][:, 0] > 0
         points = history["z"][valid, 0]
@@ -285,11 +287,12 @@ def _render(result, radius, path, physics, image_size=900, proposal=None, title=
         points = final.new_empty(0, *final.shape)
     trajectory = torch.cat([points, final[None]], dim=0).cpu()
     if proposal is None:
-        initial = trajectory[0] if len(trajectory) else final.cpu()
+        initial = trajectory[0] if len(trajectory) else final_cpu
     else:
         initial = proposal[0].detach().cpu()
-    initial_violation = float(geometry(initial[None].double(), radius[:1].cpu().double(), physics)["max_violation"][0])
-    final_violation = float(geometry(final[None].double(), radius[:1].cpu().double(), physics)["max_violation"][0])
+    metric_radius = radius_cpu[None].double()
+    initial_violation = float(geometry(initial[None].double(), metric_radius, physics)["max_violation"][0])
+    final_violation = float(geometry(final_cpu[None].double(), metric_radius, physics)["max_violation"][0])
     passed = bool(result["converged"][0]) and not bool(result["failed"][0])
     status = "PASS" if passed else "MISS"
     if "sweeps" in result:
@@ -300,7 +303,7 @@ def _render(result, radius, path, physics, image_size=900, proposal=None, title=
                 f"backtracks={int(result['backtracks'][0])}")
     try:
         rendered = render_projection_comparison(
-            initial, final.cpu(), radius[0].cpu(), path, physics.xy_limit,
+            initial, final_cpu, radius_cpu, path, physics.xy_limit,
             physics.y_ground, image_size, trajectory=trajectory,
             title=title or path.stem,
             initial_label=f"initial\nmax violation={initial_violation:.6g}",
