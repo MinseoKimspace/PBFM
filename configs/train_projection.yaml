@@ -1,45 +1,71 @@
-# Position-projection solver training.
-# model.type can be: delta, fm, grad_fm
+# Contact-energy path FM v2. Regenerate v1 caches/checkpoints in a new output folder.
 data:
-  dataset: data/box2d_next_step.pt
+  dataset: ""                  # Empty: procedural pilot; or data/box2d_next_step.pt (source only).
   train_split: train
   val_split: val
-
-train:
-  epochs: 300
-  batch_size: 128
-  lr: 0.0003
-  weight_decay: 0.0001
-  grad_clip: 1.0
-  num_workers: 8
-
-model:
-  type: grad_fm
-  hidden_dim: 256
-  time_dim: 64
-  num_layers: 3
-  message_steps: 4
+  train_count: 128
+  val_count: 32
+  num_objects: 5
+physics:
+  y_ground: 0.0
+  xy_limit: 10.0
+  slop: 0.005
   contact_margin: 0.25
-
+  density: 1.0
+flow:
+  gain: 16.0                   # Solver speed, NOT the integration step count K.
+  normalization: diagonal      # B = P C P; P uses the inverse contact mass diagonal.
+  mobility_bound: 128.0         # Cap dimensionless C per contact component, before P.
+  normalization_eps: 0.0001     # Relative epsilon: preserves common-mass scaling.
 dynamics:
   time_step: 0.0166666667
   gravity_y: -9.8
   linear_damping: 0.1
-
-loss:
-  physics_weight: 0.1
-  ground_weight: 1.0
-  collision_weight: 1.0
-  y_ground: 0.0
-  slop: 0.005
-  contact_margin: 0.25
-  contact_loss_weight: 4.0
-  correction_threshold: 0.005
-  position_noise_std: 0.01
-  velocity_noise_std: 0.05
-
+model:
+  hidden_dim: 128
+  time_dim: 32
+  message_steps: 3
+  rank: 4
+paths:
+  candidates: 8
+  rank: 4
+  start_noise_std: 0.01
+  candidate_pool: informed     # One inverse-coupling energy field + seven random PSD paths.
+  weighting: score             # --weighting uniform isolates energy ranking.
+  integral_weight: 1.0
+  proximity_weight: 0.0
+  terminal_violation_weight: 0.1 # Set 0 for score ablation; prioritizes finishing contact resolution.
+  temperature: 0.0001
+reference_solver:
+  steps: 32
+  max_steps: 1024
+  max_backtracks: 16
+  min_step: 0.00000001
+  max_displacement: 0.15
+  tolerance: 0.001
+  armijo: 0.0001
+solver:
+  steps: 16
+  max_steps: 1024
+  max_backtracks: 16
+  min_step: 0.00000001
+  max_displacement: 0.15
+  tolerance: 0.001
+  armijo: 0.0001
+train:
+  objective: fm
+  epochs: 100
+  steps_per_epoch: 100
+  batch_size: 128
+  num_workers: 0
+  lr: 0.0003
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  temperature_end: 0.00003
+  energy_steps: 4
+  min_violating_scene_coverage: 0.5 # Abort training if references cannot solve enough real contacts.
 runtime:
   seed: 42
-  device: cuda
-  outdir: runs
-  run_name: "projection_grad_fm"
+  device: auto
+  cpu_threads: 4
+  outdir: runs/contact_fm_v2

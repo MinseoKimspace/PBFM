@@ -1,21 +1,49 @@
 eval:
-  checkpoint: "runs/projection_delta/best.pt"
+  checkpoint: runs/contact_fm_v2/best.pt
+  path_cache: runs/contact_fm_v2/paths.pt
   dataset: ""
   split: val
-  batch_size: 512
-  num_workers: 8
-  solver_steps: [1, 4]
-  rollout_solver_steps: 4
-  rollout_steps: 300
-
-runtime:
-  device: cuda
-
-output:
-  json: ""
-
-render:
-  dir: ""
   count: 8
+  num_objects: 5
+  methods: [gradient, isotropic, diagonal, inverse, jacobi]
+  solver_steps: [4, 16]
+  pbd_sweeps: [4, 16, 64]        # Native full corrections, not ODE field steps.
+  rollout_count: 2
+  rollout_steps: 300
+physics:
+  y_ground: 0.0
+  xy_limit: 10.0
+  slop: 0.005
+  contact_margin: 0.25
+  density: 1.0
+flow:
+  gain: 16.0
+  normalization: diagonal
+  mobility_bound: 128.0
+  normalization_eps: 0.0001
+dynamics:
+  time_step: 0.0166666667
+  gravity_y: -9.8
+  linear_damping: 0.1
+solver:
+  steps: 16
+  max_steps: 1024
+  max_backtracks: 16
+  min_step: 0.00000001
+  max_displacement: 0.15
+  tolerance: 0.001
+  armijo: 0.0001
+preflight:
+  gains: [1.0, 4.0, 16.0, 32.0, 64.0]
+  normalizations: [none, diagonal]
+  mobility_bounds: [16.0, 128.0]
+  pbd_sweeps: [4, 16, 64]
+runtime:
+  cpu_threads: 4
+  seed: 1234
+  device: auto
+output:
+  json: runs/contact_fm_v2/eval.json
+render:
+  dir: runs/contact_fm_v2/renders
   size: 1024
-  solver_steps: 4
