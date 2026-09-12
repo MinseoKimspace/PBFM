@@ -1,5 +1,9 @@
 # Contact-energy path FM v2
 
+별도 추가 실험: [누적 multiplier flow-map A/B/C](MULTIPLIER_FLOW.md).
+새 실험은 `train_multiplier.py` / `eval_multiplier.py`를 사용하며,
+아래의 v2 구현·설정·체크포인트는 그대로 유지합니다.
+
 이 파이프라인은 Box2D의 다음 위치를 직접 회귀하지 않습니다.
 **접촉 에너지를 줄이는 후보 경로를 만들고, 그 경로의 실제 tangent를 FM으로 학습**합니다.
 v2는 보정 속도·질량 정규화·후보 품질 진단을 명시적으로 분리한 버전입니다.
