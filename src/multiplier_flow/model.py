@@ -1,25 +1,36 @@
-"""One shared contact-graph map for the endpoint and Lagrangian-matching arms."""
+"""Conditional flow matching of multiplier paths ending at converged QP solutions."""
 from __future__ import annotations
 
 import torch
 from torch import nn
-from torch.func import jvp
 
-from .problem import field, gap, matvec, position_error, projected_step
+from .problem import gap, matvec, position_error
+
+
+CHECKPOINT_FORMAT = "multiplier_cfm_v1"
+
+
+def load_model(path, config, device):
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    if checkpoint.get("format") != CHECKPOINT_FORMAT or checkpoint.get("objective") != "cfm":
+        raise ValueError("Expected a CFM checkpoint; old B/C flow-map weights cannot be reused")
+    for section in ("model", "physics", "dynamics", "reference", "data", "seed"):
+        if checkpoint["config"][section] != config[section]:
+            raise ValueError(f"Checkpoint {section} differs; use its training configuration")
+    model = ConditionalField(**config["model"]).to(device)
+    model.load_state_dict(checkpoint["model"])
+    return model.eval(), checkpoint
 
 
 def mlp(inputs, hidden, outputs):
     return nn.Sequential(nn.Linear(inputs, hidden), nn.SiLU(), nn.Linear(hidden, outputs))
 
 
-class MultiplierMap(nn.Module):
-    """Contact nodes communicate through normalized Delassus coupling.
+class ConditionalField(nn.Module):
+    """Instantaneous d(lambda)/d(tau), not an endpoint or finite-time map.
 
-    F = exp(-h)*lambda + (1-exp(-h))*nonnegative_candidate.
-    Thus F(lambda,0)=lambda and F>=0, while F-lambda can be negative.
-    The exact b=T-lambda flow has this same variation-of-constants form.
-    A zero-initialized residual head starts at a frozen-T exponential step;
-    BOTH experimental arms receive this identical analytic inductive bias.
+    The condition is the original frozen contact problem. Neither the solution
+    nor a separate clean source channel is provided. Signed rates allow release.
     """
 
     def __init__(self, hidden_dim=64, message_steps=3, length_scale=0.1):
@@ -27,56 +38,47 @@ class MultiplierMap(nn.Module):
         if hidden_dim < 1 or message_steps < 1 or length_scale <= 0:
             raise ValueError("Positive model dimensions/scale required")
         self.length_scale = length_scale
-        self.encoder = mlp(6, hidden_dim, hidden_dim)
+        self.encoder = mlp(5, hidden_dim, hidden_dim)
         self.updates = nn.ModuleList(mlp(2 * hidden_dim, hidden_dim, hidden_dim)
                                      for _ in range(message_steps))
         self.head = nn.Linear(hidden_dim, 1)
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
-    def forward(self, lam, h, problem):
-        h = h.reshape(-1, 1)
+    def forward(self, lam, tau, problem):
+        tau = tau.reshape(-1, 1).expand_as(lam)
         mask = problem["mask"]
         diagonal = problem["D"].diagonal(dim1=1, dim2=2).clamp_min(1e-12)
-        multiplier_scale = self.length_scale / diagonal
-        g = gap(problem, lam)
-        target = projected_step(problem, lam)
-        features = torch.stack((lam / multiplier_scale,
-                                problem["c"] / self.length_scale,
-                                g / self.length_scale,
-                                (target - lam) / multiplier_scale,
-                                (problem["eta"] * diagonal),
-                                torch.log1p(h).expand_as(lam)), -1)
+        scale = self.length_scale / diagonal
+        features = torch.stack((lam / scale, problem["c"] / self.length_scale,
+                                gap(problem, lam) / self.length_scale,
+                                torch.log1p(diagonal), tau), -1)
         embedding = self.encoder(features) * mask[..., None]
-        norm = (diagonal[:, :, None] * diagonal[:, None, :]).sqrt()
-        coupling = problem["D"] / norm
+        coupling = problem["D"] / (diagonal[:, :, None] * diagonal[:, None, :]).sqrt()
         coupling = coupling / coupling.abs().sum(-1, keepdim=True).clamp_min(1)
         for update in self.updates:
             embedding = (embedding + update(torch.cat((embedding, coupling @ embedding), -1))) * mask[..., None]
-        candidate = (target + multiplier_scale * self.head(embedding).squeeze(-1)).clamp_min(0)
-        weight = -torch.expm1(-h)
-        output = (1 - weight) * lam + weight * candidate
-        # Preserve exact fixed components, including nearby but feasible contacts.
-        live = matvec(problem["reach"].to(lam.dtype), (target - lam).abs()) > 0
-        return torch.where(live & mask, output, lam) * mask
+        rate = scale * self.head(embedding).squeeze(-1)
+        # Exact identity only for disconnected, initially feasible components
+        # with zero multiplier. No projected-gradient update is added to u.
+        activity = lam.abs() + problem["c"].clamp_max(0).abs()
+        live = matvec(problem["reach"].to(lam.dtype), activity) > 0
+        return rate * (mask & live)
 
 
-def losses(model, problem, start, duration, target, *, matching=False):
-    """C differentiates THROUGH both d_h F and b(F); no target detach.
+def cfm_loss(model, problem, source, target, tau):
+    """Straight conditional path, first-order parameter gradients only.
 
-    Reverse-over-forward AD computes a mixed parameter/time derivative. It is
-    not a dense spatial Hessian, but is more expensive than endpoint training.
+    lambda_tau=(1-tau)*source+tau*target, u_target=target-source.
+    target is a converged QP label, never a finite-time reference ODE label.
+    Endpoint MSE is a diagnostic, not an additional training objective.
     """
-    if matching:
-        prediction, time_derivative = jvp(lambda h: model(start, h, problem),
-                                           (duration,), (torch.ones_like(duration),))
-        error = time_derivative - field(problem, prediction)
-        diagonal = problem["D"].diagonal(dim1=1, dim2=2)
-        normalized = error * diagonal / model.length_scale
-        map_loss = ((normalized.square() * problem["mask"]).sum(-1)
-                    / problem["mask"].sum(-1).clamp_min(1)).mean()
-    else:
-        prediction = model(start, duration, problem)
-        map_loss = prediction.new_zeros(())
-    endpoint_loss = position_error(problem, prediction, target).mean() / model.length_scale**2
-    return endpoint_loss, map_loss
+    tau = tau.reshape(-1, 1)
+    state = torch.lerp(source, target, tau)
+    rate = model(state, tau[:, 0], problem)
+    scale = model.length_scale / problem["D"].diagonal(dim1=1, dim2=2).clamp_min(1e-12)
+    error = (rate - (target - source)) / scale
+    loss = ((error.square() * problem["mask"]).sum(-1)
+            / problem["mask"].sum(-1).clamp_min(1)).mean()
+    endpoint_mse = position_error(problem, state + (1 - tau) * rate, target).mean()
+    return loss, endpoint_mse.detach()

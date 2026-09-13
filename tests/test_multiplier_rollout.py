@@ -7,7 +7,7 @@ import torch
 from test_multiplier_flow import tiny_config
 from src.contact_flow.dynamics import free_position, finite_difference_state
 from src.contact_flow.physics import PhysicsConfig
-from src.multiplier_flow.model import MultiplierMap
+from src.multiplier_flow.model import ConditionalField
 from src.multiplier_flow.rollout import evaluate_motion, motion_scenes, simulate, swept_pairs
 
 
@@ -26,7 +26,7 @@ class MotionTests(unittest.TestCase):
     def test_free_flight_matches_analytic_motion_for_both_solvers(self):
         cfg = config()
         _, initial, radius = motion_scenes(PhysicsConfig())[0]
-        net = MultiplierMap(**cfg["model"]).eval()
+        net = ConditionalField(**cfg["model"]).eval()
         for model in (None, net):
             run = simulate(initial, radius, cfg, torch.device("cpu"), model)
             expected = initial[None]
@@ -53,12 +53,12 @@ class MotionTests(unittest.TestCase):
         self.assertAlmostEqual(result["max_penetration"], .8, places=6)
 
     def test_guard_failure_is_not_used_as_next_frame(self):
-        class BadMap:
+        class BadField:
             def __call__(self, x, h, problem):
-                return x + 1000
+                return torch.full_like(x, 1000)
         cfg = config()
         run = simulate(torch.tensor([[0., .44, 0., 0.]]), torch.tensor([.45]), cfg,
-                       torch.device("cpu"), BadMap(), guarded=True)
+                       torch.device("cpu"), BadField(), guarded=True)
         self.assertEqual(run["completed_steps"], 0)
         self.assertEqual(len(run["states"]), 1)
         self.assertEqual(run["failure"]["reason"], "incomplete_solver_clock")
@@ -66,15 +66,15 @@ class MotionTests(unittest.TestCase):
     def test_report_and_renderer(self):
         cfg = config()
         cfg["rollout"]["render"] = True
-        model = MultiplierMap(**cfg["model"]).eval()
+        model = ConditionalField(**cfg["model"]).eval()
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)/"rollout.json"
-            report = evaluate_motion({"endpoint": model, "map": model}, cfg, torch.device("cpu"), output)
+            report = evaluate_motion({"cfm": model}, cfg, torch.device("cpu"), output)
             self.assertEqual(len(report["scenes"]), 4)
             for name, scene in report["scenes"].items():
                 self.assertTrue((Path(directory)/f"{name}.gif").exists())
                 self.assertEqual(scene["pgs"]["completed_steps"], 3)
-                self.assertEqual(scene["map_k1_raw"]["pgs_comparison_frames"], 3)
+                self.assertEqual(scene["cfm_k1_raw"]["pgs_comparison_frames"], 3)
 
 
 if __name__ == "__main__":

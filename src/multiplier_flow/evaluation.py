@@ -1,4 +1,4 @@
-"""Numerical preflight and common finite-time/projection/cost measurements."""
+"""QP-label preflight and CFM projection, convergence and cost diagnostics."""
 from __future__ import annotations
 
 import json
@@ -11,7 +11,7 @@ from src.contact_flow.physics import PhysicsConfig
 from .data import release_problem
 from .problem import (circle_problem, converged, decode, field, gap,
                       move, pack, position_error, relinearize, residuals, select)
-from .solvers import active_set_solution, pgs, reference, run_map
+from .solvers import active_set_solution, pgs, run_cfm
 
 
 def write_json(path, report):
@@ -30,15 +30,13 @@ def timed(device, operation):
     return result, perf_counter() - begin
 
 
-def summarize(problem, lam, optimum, tolerance, target=None):
+def summarize(problem, lam, optimum, tolerance):
     stats = residuals(problem, lam)
     report = {name: float(value.mean()) for name, value in stats.items()}
     report.update(success_count=int(converged(problem, lam, tolerance).sum()),
                   samples=len(lam), max_penetration=float(stats["penetration"].max()),
                   max_projected_gradient=float(stats["projected_gradient"].max()),
                   projection_position_mse=float(position_error(problem, lam, optimum).mean()))
-    if target is not None:
-        report["finite_time_map_position_mse"] = float(position_error(problem, lam, target).mean())
     return report
 
 
@@ -82,7 +80,7 @@ def evaluation_start(problem, optimum, mode):
 
 @torch.no_grad()
 def solver_validation(model, split, config, device):
-    """Cheap ALL-world raw-map diagnostic; no ODE regeneration/guard/renderer."""
+    """ALL-world raw CFM diagnostic, grouped so release counts cannot dominate."""
     settings = config["evaluation"]
     report, all_rows = {}, []
     for mode in settings["start_modes"]:
@@ -90,17 +88,25 @@ def solver_validation(model, split, config, device):
         for index in torch.arange(len(split["names"])).split(config["train"]["batch_size"]):
             problem = move(select(split["problem"], index), device, torch.float32)
             optimum = split["optimum"][index].to(device=device, dtype=torch.float32)
-            result = run_map(model, problem, evaluation_start(problem, optimum, mode),
-                             settings["total_time"], config["train"].get("validation_calls", 8))
+            result = run_cfm(model, problem, evaluation_start(problem, optimum, mode),
+                             config["train"]["validation_calls"])
             for j, context in enumerate(index):
-                rows.append(dict(name=split["names"][int(context)], **summarize(
+                row = dict(name=split["names"][int(context)], **summarize(
                     select(problem, slice(j, j+1)), result["final"][j:j+1],
-                    optimum[j:j+1], settings["tolerance"])))
+                    optimum[j:j+1], settings["tolerance"]))
+                row["completed"] = bool(result["completed"][j])
+                row["success_count"] *= int(row["completed"])
+                rows.append(row)
         report[mode] = group_summary(rows)
         all_rows.extend(x for x in rows if not x["name"].startswith("free_flight"))
     report["nontrivial"] = dict(samples=len(all_rows),
         success_rate=sum(x["success_count"] for x in all_rows)/max(1, len(all_rows)),
         mean_projected_gradient=sum(x["projected_gradient"] for x in all_rows)/max(1, len(all_rows)))
+    groups = [stats for mode in settings["start_modes"] for name, stats in report[mode].items()
+              if not name.startswith("free_flight")]
+    report["balanced"] = dict(groups=len(groups),
+        success_rate=sum(g["success_count"]/g["samples"] for g in groups)/max(1, len(groups)),
+        mean_projected_gradient=sum(g["projected_gradient"] for g in groups)/max(1, len(groups)))
     return report
 
 
@@ -114,7 +120,7 @@ def render_case(problem, start, final, radius, config, path, title):
     return render_projection_comparison(
         initial, endpoint, radius.cpu(), Path(path), config["physics"]["xy_limit"],
         config["physics"]["y_ground"], config["evaluation"]["image_size"],
-        title=title, final_label="finite-time endpoint (no trajectory shown)")
+        title=title, final_label="projection endpoint (no trajectory shown)")
 
 
 def relinearization_check():
@@ -173,27 +179,27 @@ def preflight(config, output):
                   initial_Q_directional_derivative=slope.tolist(), cases={},
                   pgs=dict(seconds=qp_seconds, sweeps=qp["sweeps"].tolist(),
                            contact_evals=qp["contact_evals"].tolist(), tolerance=ref["qp_tolerance"]))
-    last_success = False
-    for duration in config["preflight"]["times"]:
-        result, seconds = timed(torch.device("cpu"), lambda: reference(
-            problem, start, duration, ref["rtol"], ref["atol"], ref["max_steps"]))
-        for i, (name, _, r, _) in enumerate(definitions):
-            item = summarize(select(problem, slice(i, i+1)), result["final"][i:i+1],
-                             qp["final"][i:i+1], config["evaluation"]["tolerance"])
-            item.update(nfe=int(result["nfe"][i]), rejected=int(result["rejected"][i]),
-                        reference_time=float(duration))
-            report["cases"].setdefault(name, {})[str(duration)] = item
-            if config["evaluation"]["render"] and duration == max(config["preflight"]["times"]):
-                item["rendered"] = render_case(select(problem, slice(i, i+1)), start[i:i+1],
-                    result["final"][i:i+1], r, config, Path(output).parent / "renders" / f"{name}.png", name)
-        report.setdefault("batched_reference_seconds", {})[str(duration)] = seconds
-        if duration == max(config["preflight"]["times"]):
-            last_success = bool(converged(problem, result["final"], config["evaluation"]["tolerance"]).all())
+    all_success = True
+    for i, (name, _, r, _) in enumerate(definitions):
+        single = select(problem, slice(i, i+1))
+        result = pgs(single, start[i:i+1], ref["qp_tolerance"], ref["max_sweeps"])
+        item = summarize(single, result["final"], qp["final"][i:i+1], config["evaluation"]["tolerance"])
+        # The canonical endpoint is the zero-start QP solution. Its straight
+        # source-to-target path lies in the nonnegative multiplier orthant.
+        path = torch.stack([torch.lerp(start[i], qp["final"][i], tau) for tau in (0., .25, .5, .75, 1.)])
+        item["path_nonnegative"] = bool((path >= 0).all())
+        item["reference_sweeps"] = int(result["sweeps"][0])
+        all_success &= bool(result["converged"].all()) and item["projection_position_mse"] < 1e-10
+        if config["evaluation"]["render"]:
+            item["rendered"] = render_case(single, start[i:i+1], result["final"], r, config,
+                Path(output).parent / "renders" / f"{name}.png", name)
+        report["cases"][name] = item
     report["passed"] = bool(qp["converged"].all() and max(oracle_errors) < 1e-12
-                            and (slope <= 1e-10).all() and rebound["passed"] and last_success)
-    report["cost_note"] = "Reference timings are batched CPU float64; not a neural speed claim"
+                            and (slope <= 1e-10).all() and rebound["passed"] and all_success)
+    report["cost_note"] = "PGS labels and independent oracle use CPU float64; no CFM speed claim"
     write_json(output, report)
     return report
+
 
 
 @torch.no_grad()
@@ -202,64 +208,58 @@ def evaluate(model, split, config, device, output, metadata=None):
     contexts = scene_indices(split["names"], int(settings["max_scenes"]))
     names = [split["names"][int(i)] for i in contexts]
     count = len(contexts)
-    if count < 1 or settings.get("timing_repeats", 3) < 1:
+    if count < 1 or settings["timing_repeats"] < 1:
         raise ValueError("Positive evaluation scene count and timing repeats required")
     problem64 = select(split["problem"], contexts)
     problem = move(problem64, device, torch.float32)
-    optimum = split["optimum"][contexts].to(device=device, dtype=torch.float32)
-    modes = settings["start_modes"]
-    if any(mode not in {"zero", "over", "mixed"} for mode in modes):
-        raise ValueError("Evaluation start_modes must be zero, over or mixed")
-    report = dict(scope="Frozen contacts, fixed total time; NO hidden finishing solver",
-                  device=str(device), total_time=settings["total_time"], scenes=names,
-                  guard_version="reuse_accepted_h_v2",
-                  modes={}, timings_include="Solver calls/guards, exclude cached geometry setup and data generation",
-                  cost_units="NFE counts logical per-world evaluations; seconds measure the complete batch",
-                  config=config, metadata=metadata or {})
-    for mode in modes:
-        start64 = evaluation_start(problem64, split["optimum"][contexts], mode)
-        label = reference(problem64, start64, settings["total_time"], ref["rtol"], ref["atol"], ref["max_steps"])["final"]
-        start, target = start64.to(device=device, dtype=torch.float32), label.to(device=device, dtype=torch.float32)
-        label_quality = summarize(problem64, label, split["optimum"][contexts], settings["tolerance"])
+    optimum64 = split["optimum"][contexts]
+    optimum = optimum64.to(device=device, dtype=torch.float32)
+    report = dict(scope="CFM to converged QP endpoints; frozen contacts; no finishing solver",
+                  device=str(device), tau_interval=[0., 1.], integrator="Euler", scenes=names,
+                  guard_version="cfm_euler_Q_nonnegative_v1", modes={},
+                  timings_include="Solver/guard only; exclude geometry setup and label generation",
+                  cost_units="NFE is logical per-world field evaluations; seconds measure the complete batch",
+                  config=config, metadata=metadata or {},
+                  float64_label_quality=summarize(problem64, optimum64, optimum64, settings["tolerance"]))
+    for mode in settings["start_modes"]:
+        start = evaluation_start(problem, optimum, mode)
         rows = {}
-        # Warm up the same-device kernels before measuring any method.
-        model(start, start.new_full((count,), 1.0), problem)
-        operations = {
-            "reference": lambda: reference(problem, start, settings["total_time"],
-                                             max(ref["rtol"], 1e-4), max(ref["atol"], 1e-7), ref["max_steps"]),
-            "pgs": lambda: pgs(problem, start, settings["tolerance"], ref["max_sweeps"]),
-        }
+        operations = {"pgs": lambda: pgs(problem, start, settings["tolerance"], ref["max_sweeps"])}
         for calls in settings["calls"]:
-            for guarded in (False, True):
-                name = f"map_k{calls}_{'guarded' if guarded else 'raw'}"
-                operations[name] = lambda k=calls, safe=guarded: run_map(
-                    model, problem, start, settings["total_time"], k, safe, settings["max_backtracks"])
+            for guarded in ([False, True] if settings.get("guarded", False) else [False]):
+                name = f"cfm_k{calls}_{'guarded' if guarded else 'raw'}"
+                operations[name] = lambda k=calls, safe=guarded: run_cfm(
+                    model, problem, start, k, safe, settings["max_backtracks"])
         for name, operation in operations.items():
-            operation()  # Warm up EACH solver, not just the network.
-            measurements = [timed(device, operation) for _ in range(settings.get("timing_repeats", 3))]
+            operation()
+            measurements = [timed(device, operation) for _ in range(settings["timing_repeats"])]
             result = measurements[-1][0]
-            seconds = sum(item[1] for item in measurements) / len(measurements)
-            row = summarize(problem, result["final"], optimum, settings["tolerance"], target)
-            row["seconds"] = seconds
+            row = summarize(problem, result["final"], optimum, settings["tolerance"])
+            row["seconds"] = sum(item[1] for item in measurements) / len(measurements)
             row["timing_repeats"] = len(measurements)
-            for key in ("nfe", "rejected", "sweeps", "contact_evals", "backtracks", "interventions"):
+            completed = result.get("completed", torch.ones(count, dtype=torch.bool, device=device))
+            row["converged_count"] = row["success_count"]
+            row["success_count"] = int((completed & converged(problem, result["final"], settings["tolerance"])).sum())
+            row["completed_count"] = int(completed.sum())
+            for key in ("nfe", "sweeps", "contact_evals", "backtracks", "interventions"):
                 if key in result:
                     row[key] = int(result[key].sum())
-            row["completed_count"] = int(result["completed"].sum()) if "completed" in result else count
-            row["per_scene"] = [dict(name=names[i], **summarize(
-                select(problem, slice(i, i+1)), result["final"][i:i+1], optimum[i:i+1],
-                settings["tolerance"], target[i:i+1])) for i in range(count)]
-            for i, scene in enumerate(row["per_scene"]):
-                for key in ("completed", "time", "nfe", "backtracks", "interventions",
-                            "accepted_steps", "min_accepted_h", "failure_code"):
+            row["per_scene"] = []
+            for i in range(count):
+                scene = dict(name=names[i], **summarize(select(problem, slice(i, i+1)),
+                    result["final"][i:i+1], optimum[i:i+1], settings["tolerance"]))
+                scene["converged_count"] = scene["success_count"]
+                scene["success_count"] *= int(completed[i])
+                scene["completed"] = bool(completed[i])
+                for key in ("time", "nfe", "backtracks", "interventions", "accepted_steps", "min_accepted_h", "failure_code"):
                     if key in result:
                         scene[key] = result[key][i].item()
+                row["per_scene"].append(scene)
             row["groups"] = group_summary(row["per_scene"])
             rows[name] = row
             if settings["render"] and mode == "zero":
                 render_case(select(problem, slice(0, 1)), start[:1], result["final"][:1],
                             split["radii"][int(contexts[0])], config, Path(output).parent / "renders" / f"{name}.png", name)
         report["modes"][mode] = rows
-        report.setdefault("float64_label_quality", {})[mode] = label_quality
     write_json(output, report)
     return report

@@ -1,4 +1,4 @@
-"""Physical-time diagnostic around the SAME frozen-normal PGS/B/C solve.
+"""Physical-time diagnostic around the frozen-normal PGS/CFM solve.
 
 Rebuild contacts each physical frame, start lambda=0, update velocity by FD.
 No relinearization inside a frame, restitution, friction, CCD resolution,
@@ -16,7 +16,7 @@ from src.contact_flow.dynamics import free_position, finite_difference_state
 from src.contact_flow.physics import PhysicsConfig, geometry, valid_positions
 from .evaluation import timed, write_json
 from .problem import converged, decode, gap, make_problem, pack, position_error, residuals
-from .solvers import pgs, run_map
+from .solvers import pgs, run_cfm
 
 
 def motion_scenes(physics):
@@ -82,14 +82,14 @@ def simulate(initial, radius, config, device, model=None, calls=1, guarded=False
         def solve():
             if model is None:
                 return pgs(problem, start, tolerance, ref["max_sweeps"])
-            return run_map(model, problem, start, config["evaluation"]["total_time"], calls,
+            return run_cfm(model, problem, start, calls,
                            guarded, settings.get("max_backtracks", 8))
         result, solver_seconds = timed(device, solve)
         counters = {key: int(result[key].sum()) for key in
                     ("nfe", "backtracks", "interventions", "sweeps", "contact_evals") if key in result}
         if "completed" in result and not bool(result["completed"].all()):
             failure = dict(frame=frame+1, reason="incomplete_solver_clock", counters=counters,
-                           solver_time=float(result["time"][0]), failure_code=int(result["failure_code"][0]),
+                           solver_tau=float(result["time"][0]), failure_code=int(result["failure_code"][0]),
                            attempt_seconds=dynamics_seconds+setup_seconds+solver_seconds)
             break  # A partial map is NOT silently promoted to the next physical frame.
         def update():
@@ -127,6 +127,7 @@ def simulate(initial, radius, config, device, model=None, calls=1, guarded=False
             local_qp_position_mse=(float(position_error(problem, result["final"], oracle["final"])[0])
                                    if bool(oracle["converged"][0]) else None),
             projected_gradient=float(local_stats["projected_gradient"][0]),
+            negative_multiplier=float(local_stats["negative_multiplier"][0]),
             linear_penetration=float(local_stats["penetration"][0]),
             geometric_penetration=float(after["max_violation"][0]),
             new_violations_outside_frozen_contacts=int(((actual_gap < -physics.slop-tolerance) & ~near).sum()),

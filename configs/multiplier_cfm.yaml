@@ -1,0 +1,65 @@
+# Conditional flow matching to converged QP solutions; old B/C runs are untouched.
+seed: 42
+device: auto
+cpu_threads: 1
+outdir: runs/multiplier_cfm
+physics:
+  y_ground: 0.0
+  xy_limit: 10.0
+  slop: 0.005
+  contact_margin: 0.25
+  density: 1.0
+dynamics:
+  time_step: 0.0166666667
+  gravity_y: -9.8
+  linear_damping: 0.1
+reference:
+  eta_fraction: 0.9           # Only the KKT residual scale; NOT a learned clock.
+  qp_tolerance: 0.0000001
+  max_sweeps: 10000
+data:
+  train_sizes: [3, 5]
+  val_sizes: [3, 5]
+  test_sizes: [8, 10]
+  train_per_size: 24
+  val_per_size: 8
+  test_per_size: 6
+  release_count: 4
+  floor_count: 8              # Includes feasible and tiny-penetration proposals.
+  sources_per_scene: 12       # Balanced zero/under/over/mixed/near/solved.
+  reference_batch_size: 128
+model:
+  hidden_dim: 64
+  message_steps: 3
+  length_scale: 0.1
+train:
+  epochs: 100
+  batch_size: 64
+  lr: 0.0003
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  tau_zero_fraction: 0.1      # Otherwise uniform tau in [0,1), sampled online.
+  solver_validation_every: 1000
+  validation_calls: 8
+preflight:
+  stack_sizes: [3, 5, 8, 10]
+evaluation:
+  calls: [1, 2, 4, 8, 16]     # Euler steps over the SAME interval tau=[0,1].
+  tolerance: 0.001
+  max_scenes: 0               # All scenes; report each family/particle count.
+  start_modes: [zero, over, mixed]
+  guarded: false             # Raw CFM first; --guarded adds a separate diagnostic.
+  max_backtracks: 12
+  timing_repeats: 3
+  render: true
+  image_size: 900
+rollout:
+  steps: 300                 # Physical frames; unrelated to tau.
+  calls: [1, 8]
+  guarded: false
+  max_backtracks: 8
+  frame_stride: 3
+  image_size: 480
+  render: true
+  max_speed: 100.0            # Failure bounds, not clipping.
+  max_position: 100.0
