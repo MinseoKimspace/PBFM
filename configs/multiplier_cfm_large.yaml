@@ -1,8 +1,8 @@
-# Conditional flow matching to converged QP solutions; old B/C runs are untouched.
+# Contact-structured CFM v2; raw CFM v1 / B/C results are untouched.
 seed: 42
 device: auto
 cpu_threads: 1
-outdir: runs/multiplier_cfm_large
+outdir: runs/multiplier_contact_cfm_large
 physics:
   y_ground: 0.0
   xy_limit: 10.0
@@ -39,7 +39,8 @@ train:
   lr: 0.0003
   weight_decay: 0.0001
   grad_clip: 1.0
-  tau_zero_fraction: 0.1      # Otherwise uniform tau in [0,1), sampled online.
+  tau_zero_fraction: 0.1
+  tau_min_remaining: 0.001   # Training tau <= .999; inference still reaches 1.
   solver_validation_every: 1000
   validation_calls: 8
 preflight:
@@ -49,7 +50,7 @@ evaluation:
   tolerance: 0.001
   max_scenes: 0               # All scenes; report each family/particle count.
   start_modes: [zero, over, mixed]
-  guarded: false             # Raw CFM first; --guarded adds a separate diagnostic.
+  guarded: false             # Projection is in the head; optional EXTRA Q guard.
   max_backtracks: 12
   timing_repeats: 3
   render: true

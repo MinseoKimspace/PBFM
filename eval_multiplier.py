@@ -43,6 +43,7 @@ def main():
     output = root / "cfm" / f"eval_{args.split}_{args.checkpoint}{suffix}.json"
     evaluate(model, cache["splits"][args.split], config, selected_device, output,
              metadata=dict(checkpoint=str(path), objective="cfm", epoch=checkpoint["epoch"],
+                           checkpoint_format=checkpoint["format"], solver=checkpoint["solver"],
                            updates=checkpoint["updates"], selection_metric=checkpoint["selection_metric"],
                            split=args.split, cache_format=cache["format"]))
     print(f"Saved {output}")

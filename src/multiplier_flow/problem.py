@@ -92,6 +92,20 @@ def value(problem, lam):
     return (0.5 * lam * matvec(problem["D"], lam) + problem["c"] * lam).sum(-1)
 
 
+def contact_endpoint(problem, predicted_multiplier):
+    """Solve each contact against the predicted OTHER contact multipliers.
+
+    One simultaneous (Jacobi) projected coordinate update, not a GS sweep:
+      endpoint_i = max(0, -(c_i + sum_{j!=i} D_ij * prediction_j) / D_ii).
+    Explicitly removing the diagonal avoids subtractive cancellation and makes
+    isolated contacts independent of the neural prediction. No energy guarantee.
+    """
+    diagonal = problem["D"].diagonal(dim1=1, dim2=2)
+    off_diagonal = problem["D"] - torch.diag_embed(diagonal)
+    coupled_gap = problem["c"] + matvec(off_diagonal, predicted_multiplier)
+    return (-coupled_gap / diagonal.clamp_min(1e-12)).clamp_min(0) * problem["mask"]
+
+
 def projected_step(problem, lam):
     return (lam - problem["eta"] * gap(problem, lam)).clamp_min(0) * problem["mask"]
 

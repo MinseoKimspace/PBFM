@@ -1,4 +1,4 @@
-"""Train conditional flow matching to converged frozen-contact QP endpoints."""
+"""Train contact-structured CFM; analytic projection is inside the learned field."""
 from __future__ import annotations
 
 import argparse
@@ -11,11 +11,15 @@ import torch
 from src.contact_flow.io import device, load_config
 from src.multiplier_flow.data import batch, cache_summary, prepare
 from src.multiplier_flow.evaluation import solver_validation, timed, write_json
-from src.multiplier_flow.model import CHECKPOINT_FORMAT, ConditionalField, cfm_loss
+from src.multiplier_flow.model import CHECKPOINT_FORMAT, SOLVER_DESCRIPTION, ConditionalField, cfm_loss
 
 
-def sample_tau(count, rng, zero_fraction):
-    tau = torch.rand(count, generator=rng)
+def sample_tau(count, rng, zero_fraction, min_remaining=0.001):
+    # Finite QP-label/float32 error must not be divided by arbitrarily small
+    # remaining time. Inference still integrates the full [0,1] interval.
+    if not 0 < min_remaining < 1:
+        raise ValueError("tau_min_remaining must be in (0,1)")
+    tau = torch.rand(count, generator=rng) * (1 - min_remaining)
     tau[torch.rand(count, generator=rng) < zero_fraction] = 0.
     return tau
 
@@ -38,11 +42,11 @@ def profile(model, example, selected_device):
 
 
 @torch.no_grad()
-def validate(model, split, batch_size, selected_device, seed, zero_fraction):
+def validate(model, split, batch_size, selected_device, seed, zero_fraction, min_remaining=0.001):
     rng = torch.Generator().manual_seed(seed)
     total, endpoint, count = 0., 0., len(split["context"])
     for index in torch.arange(count).split(batch_size):
-        tau = sample_tau(len(index), rng, zero_fraction).to(selected_device)
+        tau = sample_tau(len(index), rng, zero_fraction, min_remaining).to(selected_device)
         loss, mse = cfm_loss(model, *batch(split, index, selected_device), tau)
         total += float(loss) * len(index)
         endpoint += float(mse) * len(index)
@@ -69,14 +73,18 @@ def train(config, selected_device, *, prepare_only=False, profile_only=False,
     if epochs is not None and epochs < 1:
         raise ValueError("Positive epochs required")
     zero_fraction = float(settings["tau_zero_fraction"])
+    min_remaining = float(settings.get("tau_min_remaining", .001))
     if not 0 <= zero_fraction < 1:
         raise ValueError("tau_zero_fraction must be in [0,1); CFM must sample intermediate times")
+    if not 0 < min_remaining < 1:
+        raise ValueError("tau_min_remaining must be in (0,1)")
     torch.manual_seed(int(config["seed"]))
     model = ConditionalField(**config["model"]).to(selected_device)
     training, validation = cache["splits"]["train"], cache["splits"]["val"]
     example = batch(training, torch.arange(min(settings["batch_size"], len(training["context"]))), selected_device)
     profiling = profile(model, example, selected_device)
-    write_json(root / "profile_cfm.json", dict(device=str(selected_device), costs=profiling))
+    write_json(root / "profile_cfm.json", dict(device=str(selected_device), costs=profiling,
+                                             solver=SOLVER_DESCRIPTION, format=CHECKPOINT_FORMAT))
     if profile_only:
         return profiling
     run.mkdir(parents=True, exist_ok=True)
@@ -96,7 +104,7 @@ def train(config, selected_device, *, prepare_only=False, profile_only=False,
         tau_rng = torch.Generator().manual_seed(config["seed"] + 100000 + epoch)
         total, endpoint, seen = 0., 0., 0
         for indices in torch.randperm(count, generator=order_rng).split(settings["batch_size"]):
-            tau = sample_tau(len(indices), tau_rng, zero_fraction).to(selected_device)
+            tau = sample_tau(len(indices), tau_rng, zero_fraction, min_remaining).to(selected_device)
             loss, mse = cfm_loss(model, *batch(training, indices, selected_device), tau)
             if not torch.isfinite(loss):
                 raise FloatingPointError("Nonfinite CFM loss; checkpoint not updated")
@@ -112,7 +120,7 @@ def train(config, selected_device, *, prepare_only=False, profile_only=False,
                 break
         model.eval()
         val = validate(model, validation, settings["batch_size"], selected_device,
-                       config["seed"] + 200000, zero_fraction)
+                       config["seed"] + 200000, zero_fraction, min_remaining)
         if not all(math.isfinite(x) for x in val.values()):
             raise FloatingPointError("Nonfinite validation metrics")
         row = dict(epoch=epoch+1, updates=updates, train_cfm=total/seen,
@@ -126,7 +134,7 @@ def train(config, selected_device, *, prepare_only=False, profile_only=False,
             last_diagnostic = updates
         history.append(row)
         checkpoint = dict(format=CHECKPOINT_FORMAT, objective="cfm", epoch=epoch+1, updates=updates,
-                          config=config, cache_spec=cache["spec"], model=model.state_dict(),
+                          solver=SOLVER_DESCRIPTION, config=config, cache_spec=cache["spec"], model=model.state_dict(),
                           optimizer=optimizer.state_dict(), val_cfm=val["cfm"],
                           selection_metric="fixed-sample validation CFM loss")
         torch.save(checkpoint, run / "last.pt")

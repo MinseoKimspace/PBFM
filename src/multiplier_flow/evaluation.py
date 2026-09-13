@@ -9,7 +9,8 @@ import torch
 
 from src.contact_flow.physics import PhysicsConfig
 from .data import release_problem
-from .problem import (circle_problem, converged, decode, field, gap,
+from .model import CHECKPOINT_FORMAT, SOLVER_DESCRIPTION, ConditionalField, LocalProjection
+from .problem import (circle_problem, contact_endpoint, converged, decode, field, gap,
                       move, pack, position_error, relinearize, residuals, select)
 from .solvers import active_set_solution, pgs, run_cfm
 
@@ -196,6 +197,32 @@ def preflight(config, output):
         report["cases"][name] = item
     report["passed"] = bool(qp["converged"].all() and max(oracle_errors) < 1e-12
                             and (slope <= 1e-10).all() and rebound["passed"] and all_success)
+    # Verify the NEW head before training, not just the old label generator.
+    # An exact coupling rate must reproduce the same CFM straight path, even
+    # when a multiplier needs to decrease. This is a representability check,
+    # NOT a claim about an untrained network's coupled-contact accuracy.
+    net = ConditionalField(**config["model"]).double()
+    scalar = select(problem, slice(0, 3))
+    with torch.no_grad():
+        net.head.bias.fill_(100.)  # Isolated contact cannot depend on this head.
+        isolated = run_cfm(net, scalar, start[:3], 4)
+        isolated_error = float(position_error(scalar, isolated["final"], qp["final"][:3]).max())
+    exact_rate = qp["final"] - start
+    matching_error, endpoint_error = [], []
+    for tau in (0., .5, .99):
+        times = start.new_full((len(start),), tau)
+        state = torch.lerp(start, qp["final"], tau)
+        # Inject the known coupling rate only for this non-learning check.
+        endpoint = contact_endpoint(problem, state + (1 - tau) * exact_rate)
+        matching_error.append(float(((endpoint-state)/(1-tau)-exact_rate).abs().max()))
+        endpoint_error.append(float(position_error(problem, endpoint, qp["final"]).max()))
+    report["structured_head"] = dict(
+        isolated_untrained_position_mse=isolated_error,
+        exact_coupling_field_max_error=max(matching_error),
+        exact_coupling_endpoint_position_mse=max(endpoint_error),
+        passed=isolated_error < 1e-12 and max(matching_error) < 1e-4 and max(endpoint_error) < 1e-10,
+        scope="Isolated analytic solve + exact-coupling representability; not learned performance")
+    report["passed"] &= report["structured_head"]["passed"]
     report["cost_note"] = "PGS labels and independent oracle use CPU float64; no CFM speed claim"
     write_json(output, report)
     return report
@@ -214,11 +241,14 @@ def evaluate(model, split, config, device, output, metadata=None):
     problem = move(problem64, device, torch.float32)
     optimum64 = split["optimum"][contexts]
     optimum = optimum64.to(device=device, dtype=torch.float32)
-    report = dict(scope="CFM to converged QP endpoints; frozen contacts; no finishing solver",
-                  device=str(device), tau_interval=[0., 1.], integrator="Euler", scenes=names,
+    report = dict(scope=SOLVER_DESCRIPTION,
+                  model_format=CHECKPOINT_FORMAT,
+                  device=str(device), tau_interval=[0., 1.], integrator="convex-combination Euler", scenes=names,
+                  raw_definition="Analytic contact projection is in the head; no EXTRA guard/finish",
+                  local_definition="No neural coupling; same projected endpoint and tau schedule, not native Jacobi",
                   guard_version="cfm_euler_Q_nonnegative_v1", modes={},
                   timings_include="Solver/guard only; exclude geometry setup and label generation",
-                  cost_units="NFE is logical per-world field evaluations; seconds measure the complete batch",
+                  cost_units="NFE is endpoint evaluations; neural_evals excludes local ablation; seconds measure the complete batch",
                   config=config, metadata=metadata or {},
                   float64_label_quality=summarize(problem64, optimum64, optimum64, settings["tolerance"]))
     for mode in settings["start_modes"]:
@@ -227,6 +257,9 @@ def evaluate(model, split, config, device, output, metadata=None):
         operations = {"pgs": lambda: pgs(problem, start, settings["tolerance"], ref["max_sweeps"])}
         for calls in settings["calls"]:
             for guarded in ([False, True] if settings.get("guarded", False) else [False]):
+                local_name = f"local_k{calls}_{'guarded' if guarded else 'raw'}"
+                operations[local_name] = lambda k=calls, safe=guarded: run_cfm(
+                    LocalProjection(), problem, start, k, safe, settings["max_backtracks"])
                 name = f"cfm_k{calls}_{'guarded' if guarded else 'raw'}"
                 operations[name] = lambda k=calls, safe=guarded: run_cfm(
                     model, problem, start, k, safe, settings["max_backtracks"])
@@ -241,7 +274,7 @@ def evaluate(model, split, config, device, output, metadata=None):
             row["converged_count"] = row["success_count"]
             row["success_count"] = int((completed & converged(problem, result["final"], settings["tolerance"])).sum())
             row["completed_count"] = int(completed.sum())
-            for key in ("nfe", "sweeps", "contact_evals", "backtracks", "interventions"):
+            for key in ("nfe", "neural_evals", "sweeps", "contact_evals", "backtracks", "interventions"):
                 if key in result:
                     row[key] = int(result[key].sum())
             row["per_scene"] = []
@@ -251,7 +284,7 @@ def evaluate(model, split, config, device, output, metadata=None):
                 scene["converged_count"] = scene["success_count"]
                 scene["success_count"] *= int(completed[i])
                 scene["completed"] = bool(completed[i])
-                for key in ("time", "nfe", "backtracks", "interventions", "accepted_steps", "min_accepted_h", "failure_code"):
+                for key in ("time", "nfe", "neural_evals", "backtracks", "interventions", "accepted_steps", "min_accepted_h", "failure_code"):
                     if key in result:
                         scene[key] = result[key][i].item()
                 row["per_scene"].append(scene)

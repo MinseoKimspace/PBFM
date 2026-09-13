@@ -2,7 +2,8 @@
 
 Rebuild contacts each physical frame, start lambda=0, update velocity by FD.
 No relinearization inside a frame, restitution, friction, CCD resolution,
-warm-start transfer, clipping, or hidden finishing solver. Geometric/swept
+warm-start transfer, position/velocity clipping, or hidden finishing solver.
+CFM DOES contain analytic multiplier projection in its endpoint head. Geometric/swept
 checks only measure errors; they NEVER correct the trajectory.
 """
 from __future__ import annotations
@@ -15,6 +16,7 @@ import torch
 from src.contact_flow.dynamics import free_position, finite_difference_state
 from src.contact_flow.physics import PhysicsConfig, geometry, valid_positions
 from .evaluation import timed, write_json
+from .model import CHECKPOINT_FORMAT, SOLVER_DESCRIPTION, LocalProjection
 from .problem import converged, decode, gap, make_problem, pack, position_error, residuals
 from .solvers import pgs, run_cfm
 
@@ -86,7 +88,7 @@ def simulate(initial, radius, config, device, model=None, calls=1, guarded=False
                            guarded, settings.get("max_backtracks", 8))
         result, solver_seconds = timed(device, solve)
         counters = {key: int(result[key].sum()) for key in
-                    ("nfe", "backtracks", "interventions", "sweeps", "contact_evals") if key in result}
+                    ("nfe", "neural_evals", "backtracks", "interventions", "sweeps", "contact_evals") if key in result}
         if "completed" in result and not bool(result["completed"].all()):
             failure = dict(frame=frame+1, reason="incomplete_solver_clock", counters=counters,
                            solver_tau=float(result["time"][0]), failure_code=int(result["failure_code"][0]),
@@ -220,12 +222,16 @@ def evaluate_motion(models, config, device, output, metadata=None):
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     report = dict(scope="Per-frame frozen contact diagnostic; fresh lambda=0; no finish/restitution/friction/CCD",
+        model_format=CHECKPOINT_FORMAT, solver=SOLVER_DESCRIPTION,
+        raw_definition="Analytic projection in the endpoint head; no EXTRA guard/finish",
+        local_definition="No neural coupling; identical endpoint formula and tau schedule",
         timing_scope="Simulation includes free dynamics, geometry/D/eta setup, solve, FD; excludes oracle/metrics/rendering. Not a speed benchmark.",
         swept_scope="Straight previous-to-next position segments only, NOT internal solver trajectories",
         device=str(device), config=config, metadata=metadata or {}, scenes={})
     for name, initial, radius in motion_scenes(physics):
         results = {"pgs": simulate(initial, radius, config, device)}
-        for objective, model in models.items():
+        compared = dict(local=LocalProjection(), **models) if models else {}
+        for objective, model in compared.items():
             for calls in settings["calls"]:
                 results[f"{objective}_k{calls}_raw"] = simulate(initial, radius, config, device, model, calls)
                 if settings.get("guarded", False):

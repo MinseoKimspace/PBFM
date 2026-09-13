@@ -7,8 +7,8 @@ import torch
 
 from src.multiplier_flow.data import CACHE_FORMAT, prepare, release_problem, sample_pairs
 from src.multiplier_flow.evaluation import evaluate, preflight, relinearization_check, scene_indices, solver_validation
-from src.multiplier_flow.model import CHECKPOINT_FORMAT, ConditionalField, cfm_loss, load_model
-from src.multiplier_flow.problem import (converged, decode, field, gap, make_problem,
+from src.multiplier_flow.model import CHECKPOINT_FORMAT, ConditionalField, LocalProjection, cfm_loss, load_model
+from src.multiplier_flow.problem import (contact_endpoint, converged, decode, field, gap, make_problem, move,
                                          pack, position_error, select, value)
 from src.multiplier_flow.solvers import active_set_solution, pgs, run_cfm
 
@@ -18,6 +18,14 @@ def scalar_problem():
                               torch.ones(1, 1, dtype=torch.float64),
                               torch.ones(1, dtype=torch.float64),
                               torch.tensor([-.1], dtype=torch.float64), eta_fraction=1.)])
+
+
+class EndpointFunction:
+    """Small endpoint-model test double; not a production unconstrained field."""
+    neural_evaluations = 1
+
+    def __init__(self, function):
+        self.endpoint = function
 
 
 def tiny_config():
@@ -85,7 +93,7 @@ class ProblemTests(unittest.TestCase):
             net = ConditionalField(hidden_dim=8, message_steps=1).double()
             with torch.no_grad():
                 net.head.bias.fill_(10.)
-            torch.testing.assert_close(net(x, torch.ones(1), p), x)
+            torch.testing.assert_close(net(x, torch.full((1,), .5), p), x)
             torch.testing.assert_close(run_cfm(net, p, x, 4)["final"], x)
 
 
@@ -93,8 +101,11 @@ class FieldTests(unittest.TestCase):
     def test_loss_matches_conditional_path_not_reference_ode(self):
         class ExactField:
             length_scale = .1
+            neural_evaluations = 1
             def __call__(self, state, tau, problem):
                 return (.1-state)/(1-tau[:, None])
+            def endpoint(self, state, tau, problem):
+                return torch.full_like(state, .1)
         p = scalar_problem()
         for initial in (0., .1, .2):
             source = torch.full_like(p["c"], initial)
@@ -109,23 +120,22 @@ class FieldTests(unittest.TestCase):
                 self.assertEqual(int(result["nfe"]), calls)
                 self.assertEqual(float(result["time"]), 1.)
 
-    def test_raw_euler_has_no_hidden_clipping_or_finish(self):
-        class NegativeField:
-            def __call__(self, state, tau, problem):
-                return -torch.ones_like(state)
+    def test_invalid_endpoint_is_rejected_not_silently_clipped(self):
+        model = EndpointFunction(lambda state, tau, problem: -torch.ones_like(state))
         p = scalar_problem()
-        result = run_cfm(NegativeField(), p, torch.zeros_like(p["c"]), 4)
-        self.assertTrue(result["completed"].all())
-        torch.testing.assert_close(result["final"], -torch.ones_like(p["c"]))
+        result = run_cfm(model, p, torch.zeros_like(p["c"]), 4)
+        self.assertFalse(result["completed"].any())
+        self.assertEqual(int(result["failure_code"]), 4)
+        torch.testing.assert_close(result["final"], torch.zeros_like(p["c"]))
         self.assertFalse(converged(p, result["final"], .001).any())
 
     def test_tau_increases_and_field_is_recomputed(self):
         seen = []
         def field_at_time(state, tau, problem):
             seen.append(tau.clone())
-            return tau[:, None].expand_as(state)
+            return state + (1-tau[:, None]) * tau[:, None].expand_as(state)
         p = scalar_problem()
-        result = run_cfm(field_at_time, p, torch.zeros_like(p["c"]), 4)
+        result = run_cfm(EndpointFunction(field_at_time), p, torch.zeros_like(p["c"]), 4)
         self.assertEqual([float(t) for t in seen], [0., .25, .5, .75])
         self.assertAlmostEqual(float(result["final"]), .375)
 
@@ -150,6 +160,7 @@ class FieldTests(unittest.TestCase):
         with torch.no_grad():
             net.head.bias.fill_(original)
         self.assertAlmostEqual(analytic, (values[1]-values[0])/2e-5, delta=1e-6)
+        self.assertGreater(abs(analytic), 1e-6)
         permuted = pack([dict(single, J=single["J"].flip(0), c=single["c"].flip(0))])
         torch.testing.assert_close(net(source, tau, p).flip(1), net(source.flip(1), tau, permuted))
 
@@ -158,32 +169,124 @@ class FieldTests(unittest.TestCase):
         start = torch.zeros_like(p["c"])
         def good(state, tau, problem):
             return torch.full_like(state, .1)
-        result = run_cfm(good, p, start, 4, guarded=True)
+        result = run_cfm(EndpointFunction(good), p, start, 4, guarded=True)
         self.assertTrue(result["completed"].all())
         self.assertLessEqual(float(value(p, result["final"])), float(value(p, start)))
         def bad(state, tau, problem):
             return torch.full_like(state, 1000.)
-        result = run_cfm(bad, p, start, 1, guarded=True, max_backtracks=2)
+        result = run_cfm(EndpointFunction(bad), p, start, 1, guarded=True, max_backtracks=2)
         self.assertFalse(result["completed"].any())
         self.assertEqual(int(result["nfe"]), 1)  # Backtracking reuses the slope.
         self.assertEqual(int(result["backtracks"]), 2)
         torch.testing.assert_close(result["final"], start)
         def nonfinite(state, tau, problem):
             return torch.full_like(state, float("nan"))
-        result = run_cfm(nonfinite, p, start, 1)
+        result = run_cfm(EndpointFunction(nonfinite), p, start, 1)
         self.assertEqual(int(result["failure_code"]), 3)
         torch.testing.assert_close(result["final"], start)
 
+    def test_isolated_projection_exact_despite_arbitrary_neural_weights(self):
+        for dtype in (torch.float32, torch.float64):
+            p = {k: v.to(dtype=dtype) if v.is_floating_point() else v for k, v in scalar_problem().items()}
+            net = ConditionalField(hidden_dim=8, message_steps=1).to(dtype=dtype)
+            with torch.no_grad():
+                for parameter in net.parameters():
+                    parameter.uniform_(-2, 2)
+            for source_value in (0., .1, .3):
+                source = torch.full_like(p["c"], source_value)
+                for calls in (1, 3, 7, 16):
+                    result = run_cfm(net, p, source, calls)
+                    torch.testing.assert_close(result["final"], torch.full_like(source, .1))
+                    self.assertEqual(int(result["nfe"]), calls)
+                    self.assertTrue(result["completed"].all())
+
+    def test_exact_coupling_recovers_path_and_multiplier_release(self):
+        p = pack([release_problem()])
+        source = torch.tensor([[.2, .03]], dtype=torch.float64)
+        target = torch.tensor([[0., .15]], dtype=torch.float64)
+        net = ConditionalField(hidden_dim=8, message_steps=1).double()
+        net.coupling_rate = lambda state, tau, problem: (target-state)/(1-tau[:, None])
+        for tau in (0., .5, .99, .9999):
+            loss, mse = cfm_loss(net, p, source, target, torch.tensor([tau], dtype=torch.float64))
+            self.assertLess(float(loss), 1e-18)
+            self.assertLess(float(mse), 1e-20)
+        for calls in (1, 3, 8):
+            result = run_cfm(net, p, source, calls)
+            torch.testing.assert_close(result["final"], target, atol=1e-12, rtol=0)
+        with self.assertRaisesRegex(ValueError, "tau"):
+            net(source, torch.ones(1), p)
+
+    def test_local_ablation_equals_zero_coupling_and_nonnegative_path(self):
+        p = pack([release_problem()])
+        source = torch.tensor([[.2, .03]], dtype=torch.float64)
+        net = ConditionalField(hidden_dim=8, message_steps=1).double()
+        for calls in (1, 4, 8):
+            actual = run_cfm(net, p, source, calls)
+            local = run_cfm(LocalProjection(), p, source, calls)
+            torch.testing.assert_close(actual["final"], local["final"])
+            self.assertEqual(int(local["neural_evals"]), 0)
+        seen = []
+        def extreme_endpoint(state, tau, problem):
+            seen.append(state.clone())
+            return torch.tensor([[100., 0.]], dtype=state.dtype)
+        result = run_cfm(EndpointFunction(extreme_endpoint), p, source, 7)
+        self.assertTrue(all((state >= 0).all() for state in seen))
+        self.assertTrue((result["final"] >= 0).all())
+        # Nonnegative is NOT the same as solved; no hidden PGS finish.
+        self.assertFalse(converged(p, result["final"], .001).any())
+
+    def test_endpoint_formula_equals_projected_coordinate_update(self):
+        p = pack([release_problem()])
+        lam = torch.tensor([[.2, .03]], dtype=torch.float64)
+        rate = torch.tensor([[-.15, .2]], dtype=torch.float64)
+        remaining = .7
+        diagonal = p["D"].diagonal(dim1=1, dim2=2)
+        off_diagonal = p["D"] - torch.diag_embed(diagonal)
+        cross = (off_diagonal @ rate[..., None]).squeeze(-1)
+        expected = (lam - (gap(p, lam) + remaining*cross)/diagonal).clamp_min(0)
+        torch.testing.assert_close(contact_endpoint(p, lam+remaining*rate), expected)
+
+    def test_coupled_cfm_can_learn_through_the_projection(self):
+        # A controlled fit, not a generalization/rollout claim. In particular,
+        # every source and tau is fixed so the test measures optimizer progress.
+        torch.manual_seed(7)
+        p = pack([release_problem()])
+        optimum = pgs(p, torch.zeros_like(p["c"]), 1e-10)["final"]
+        pairs = sample_pairs(p, optimum, dict(sources_per_scene=60), torch.Generator().manual_seed(7))
+        p = move(select(p, pairs["context"]), "cpu", torch.float32)
+        source, target = pairs["source"].float(), pairs["target"].float()
+        model = ConditionalField(hidden_dim=32, message_steps=3)
+        optimizer = torch.optim.Adam(model.parameters(), lr=.002)
+        tau = torch.linspace(0, .95, len(source))
+        initial = float(cfm_loss(model, p, source, target, tau)[0].detach())
+        for _ in range(300):
+            loss, _ = cfm_loss(model, p, source, target, tau)
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.)
+            optimizer.step()
+        self.assertLess(float(loss.detach()), initial*.05)
+
 
 class PipelineTests(unittest.TestCase):
+    def test_training_tau_avoids_the_singular_endpoint(self):
+        from train_multiplier import sample_tau
+        tau = sample_tau(1000, torch.Generator().manual_seed(2), .1, .001)
+        self.assertTrue((tau >= 0).all() and (tau < .999).all())
+        self.assertTrue((tau == 0).any())
+        self.assertTrue((tau > 0).any())
+        for epsilon in (0., 1., -1.):
+            with self.assertRaises(ValueError):
+                sample_tau(10, torch.Generator(), .1, epsilon)
+
     def test_incomplete_flow_never_counts_as_solver_success(self):
         p = scalar_problem()
         def fails_after_reaching_solution(state, tau, problem):
-            return torch.where(tau[:, None] == 0, 2*(.1-state), torch.full_like(state, float("nan")))
+            return torch.where(tau[:, None] == 0, state+2*(.1-state), torch.full_like(state, float("nan")))
         cfg = tiny_config()
         cfg["evaluation"]["start_modes"] = ["zero"]
         split = dict(problem=p, optimum=torch.full_like(p["c"], .1), names=["floor_0"])
-        report = solver_validation(fails_after_reaching_solution, split, cfg, torch.device("cpu"))
+        report = solver_validation(EndpointFunction(fails_after_reaching_solution), split, cfg, torch.device("cpu"))
         self.assertEqual(report["balanced"]["success_rate"], 0.)
 
     def test_balanced_sources_target_optimum_and_fixed_anchor(self):
@@ -228,6 +331,8 @@ class PipelineTests(unittest.TestCase):
             report = evaluate(net, cache["splits"]["test"], cfg, torch.device("cpu"), Path(directory)/"eval.json")
             self.assertEqual(report["tau_interval"], [0., 1.])
             self.assertIn("cfm_k1_raw", report["modes"]["zero"])
+            self.assertIn("local_k1_raw", report["modes"]["zero"])
+            self.assertEqual(report["model_format"], CHECKPOINT_FORMAT)
             self.assertNotIn("finite_time_map_position_mse", report["modes"]["zero"]["cfm_k1_raw"])
             self.assertIn("negative_multiplier", report["modes"]["over"]["cfm_k2_guarded"])
             self.assertIn("balanced", checkpoint.get("solver_validation", {}) or
@@ -240,6 +345,9 @@ class PipelineTests(unittest.TestCase):
             torch.save(dict(format="multiplier_map_v1", objective="map"), old)
             with self.assertRaisesRegex(ValueError, "old B/C"):
                 load_model(old, cfg, torch.device("cpu"))
+            torch.save(dict(format="multiplier_cfm_v1", objective="cfm"), old)
+            with self.assertRaisesRegex(ValueError, "raw CFM v1"):
+                load_model(old, cfg, torch.device("cpu"))
             legacy_cache = Path(directory)/"old_cache.pt"
             torch.save(dict(format="multiplier_segments_v2", spec=cache["spec"]), legacy_cache)
             with self.assertRaises(ValueError):
@@ -251,6 +359,7 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             result = preflight(cfg, Path(directory)/"preflight.json")
             self.assertTrue(result["passed"])
+            self.assertTrue(result["structured_head"]["passed"])
             self.assertTrue((Path(directory)/"renders"/"floor_under.png").exists())
 
 

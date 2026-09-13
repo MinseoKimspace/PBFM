@@ -39,6 +39,7 @@ def main():
         model, checkpoint = load_model(path, config, selected_device)
         models["cfm"] = model
         metadata["cfm"] = dict(checkpoint=str(path), epoch=checkpoint["epoch"], updates=checkpoint["updates"],
+            checkpoint_format=checkpoint["format"], solver=checkpoint["solver"],
             training_config={key: checkpoint["config"][key] for key in ("seed", "data", "train")},
             selection_metric=checkpoint["selection_metric"])
     label = "pgs" if args.pgs_only else f"{args.checkpoint}_cfm"

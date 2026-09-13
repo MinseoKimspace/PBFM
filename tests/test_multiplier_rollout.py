@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-from test_multiplier_flow import tiny_config
+from test_multiplier_flow import EndpointFunction, tiny_config
 from src.contact_flow.dynamics import free_position, finite_difference_state
 from src.contact_flow.physics import PhysicsConfig
 from src.multiplier_flow.model import ConditionalField
@@ -40,10 +40,12 @@ class MotionTests(unittest.TestCase):
     def test_resting_floor_projection_and_fd(self):
         cfg = config()
         initial = torch.tensor([[0., .45-cfg["physics"]["slop"], 0., 0.]])
-        run = simulate(initial, torch.tensor([.45]), cfg, torch.device("cpu"))
-        self.assertIsNone(run["failure"])
-        torch.testing.assert_close(run["states"][-1], initial, atol=1e-4, rtol=0)
-        self.assertLess(run["summary"]["max_geometric_penetration"], .001)
+        for model in (None, ConditionalField(**cfg["model"]).eval()):
+            for calls in (1, 8):
+                run = simulate(initial, torch.tensor([.45]), cfg, torch.device("cpu"), model, calls)
+                self.assertIsNone(run["failure"])
+                torch.testing.assert_close(run["states"][-1], initial, atol=1e-4, rtol=0)
+                self.assertLess(run["summary"]["max_geometric_penetration"], .001)
 
     def test_swept_diagnostic_catches_endpoint_invisible_crossing(self):
         start = torch.tensor([[-1., 1.], [1., 1.]])
@@ -53,12 +55,10 @@ class MotionTests(unittest.TestCase):
         self.assertAlmostEqual(result["max_penetration"], .8, places=6)
 
     def test_guard_failure_is_not_used_as_next_frame(self):
-        class BadField:
-            def __call__(self, x, h, problem):
-                return torch.full_like(x, 1000)
+        model = EndpointFunction(lambda x, tau, problem: torch.full_like(x, 1000))
         cfg = config()
         run = simulate(torch.tensor([[0., .44, 0., 0.]]), torch.tensor([.45]), cfg,
-                       torch.device("cpu"), BadField(), guarded=True)
+                       torch.device("cpu"), model, guarded=True)
         self.assertEqual(run["completed_steps"], 0)
         self.assertEqual(len(run["states"]), 1)
         self.assertEqual(run["failure"]["reason"], "incomplete_solver_clock")

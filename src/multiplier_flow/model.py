@@ -1,19 +1,24 @@
-"""Conditional flow matching of multiplier paths ending at converged QP solutions."""
+"""CFM with analytic contact projection and learned cross-contact correction."""
 from __future__ import annotations
 
 import torch
 from torch import nn
 
-from .problem import gap, matvec, position_error
+from .problem import contact_endpoint, gap, matvec, position_error
 
 
-CHECKPOINT_FORMAT = "multiplier_cfm_v1"
+CHECKPOINT_FORMAT = "multiplier_contact_cfm_v2"
+
+SOLVER_DESCRIPTION = (
+    "Contact-structured CFM: learned cross-contact rates, analytic projected "
+    "coordinate endpoint, convex-combination Euler; not sequential PGS"
+)
 
 
 def load_model(path, config, device):
     checkpoint = torch.load(path, map_location=device, weights_only=True)
     if checkpoint.get("format") != CHECKPOINT_FORMAT or checkpoint.get("objective") != "cfm":
-        raise ValueError("Expected a CFM checkpoint; old B/C flow-map weights cannot be reused")
+        raise ValueError("Expected contact-structured CFM v2; raw CFM v1 and old B/C weights cannot be reused")
     for section in ("model", "physics", "dynamics", "reference", "data", "seed"):
         if checkpoint["config"][section] != config[section]:
             raise ValueError(f"Checkpoint {section} differs; use its training configuration")
@@ -26,12 +31,29 @@ def mlp(inputs, hidden, outputs):
     return nn.Sequential(nn.Linear(inputs, hidden), nn.SiLU(), nn.Linear(hidden, outputs))
 
 
-class ConditionalField(nn.Module):
-    """Instantaneous d(lambda)/d(tau), not an endpoint or finite-time map.
+class LocalProjection:
+    """No-network ablation: the same endpoint formula/clock, no predicted coupling.
 
-    The condition is the original frozen contact problem. Neither the solution
-    nor a separate clean source channel is provided. Signed rates allow release.
+    This is NOT native Jacobi iteration: run_cfm interpolates to this endpoint
+    with its remaining-time schedule. PGS remains the native solver baseline.
     """
+
+    neural_evaluations = 0
+
+    def endpoint(self, lam, tau, problem):
+        return contact_endpoint(problem, lam)
+
+
+class ConditionalField(nn.Module):
+    """Predict coupling; solve each scalar contact analytically inside the field.
+
+    q = lambda + (1-tau)*r_theta estimates other contacts' endpoint multipliers.
+    end = contact_endpoint(q); u_theta = (end-lambda)/(1-tau).
+    Signed rates permit release, while end is nonnegative by construction.
+    The fixed original problem is the condition; no solution is an input.
+    """
+
+    neural_evaluations = 1
 
     def __init__(self, hidden_dim=64, message_steps=3, length_scale=0.1):
         super().__init__()
@@ -45,7 +67,7 @@ class ConditionalField(nn.Module):
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
-    def forward(self, lam, tau, problem):
+    def coupling_rate(self, lam, tau, problem):
         tau = tau.reshape(-1, 1).expand_as(lam)
         mask = problem["mask"]
         diagonal = problem["D"].diagonal(dim1=1, dim2=2).clamp_min(1e-12)
@@ -59,11 +81,24 @@ class ConditionalField(nn.Module):
         for update in self.updates:
             embedding = (embedding + update(torch.cat((embedding, coupling @ embedding), -1))) * mask[..., None]
         rate = scale * self.head(embedding).squeeze(-1)
-        # Exact identity only for disconnected, initially feasible components
-        # with zero multiplier. No projected-gradient update is added to u.
+        # Do not invent coupling for a disconnected, initially feasible component.
         activity = lam.abs() + problem["c"].clamp_max(0).abs()
         live = matvec(problem["reach"].to(lam.dtype), activity) > 0
         return rate * (mask & live)
+
+    def endpoint(self, lam, tau, problem):
+        # Predict a RATE so the learned remaining correction vanishes as tau->1.
+        # This keeps the straight-path training target representable: if
+        # r_theta=target-source and target is KKT, this returns target exactly.
+        remaining = 1 - tau.reshape(-1, 1)
+        predicted = lam + remaining * self.coupling_rate(lam, tau, problem)
+        return contact_endpoint(problem, predicted)
+
+    def forward(self, lam, tau, problem):
+        remaining = 1 - tau.reshape(-1, 1)
+        if (remaining <= 0).any() or (remaining > 1).any():
+            raise ValueError("CFM field requires 0 <= tau < 1; never evaluate at tau=1")
+        return (self.endpoint(lam, tau, problem) - lam) / remaining
 
 
 def cfm_loss(model, problem, source, target, tau):
@@ -71,7 +106,8 @@ def cfm_loss(model, problem, source, target, tau):
 
     lambda_tau=(1-tau)*source+tau*target, u_target=target-source.
     target is a converged QP label, never a finite-time reference ODE label.
-    Endpoint MSE is a diagnostic, not an additional training objective.
+    The matched field INCLUDES the analytic projection; do not match the raw
+    neural coupling head. Endpoint MSE is diagnostic, not an extra objective.
     """
     tau = tau.reshape(-1, 1)
     state = torch.lerp(source, target, tau)

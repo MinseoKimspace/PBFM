@@ -1,4 +1,4 @@
-"""Converged QP labels/baseline and Euler integration of the learned CFM field."""
+"""PGS labels/baseline and structure-preserving Euler for contact CFM."""
 from __future__ import annotations
 
 from itertools import combinations
@@ -63,12 +63,14 @@ def active_set_solution(problem, max_contacts=12, tolerance=1e-8):
 
 @torch.no_grad()
 def run_cfm(model, problem, start, calls, guarded=False, max_backtracks=12):
-    """Integrate d(lambda)/d(tau)=u_theta on [0,1] with explicit Euler.
+    """Euler on [0,1], evaluated as a nonnegative convex combination.
 
-    Raw means no multiplier clipping, no energy projection and no PGS finish.
-    Guarded is a SEPARATE diagnostic: halve the Euler step until lambda>=0 and
-    Q does not increase. It changes the numerical path and may fail to finish.
-    NFE counts field evaluations; backtracking reuses the current Euler slope.
+    u=(endpoint-lambda)/(1-tau), alpha=h/(1-tau) <= 1, hence
+    lambda_next=(1-alpha)*lambda+alpha*endpoint. No division of the field near
+    tau=1 or post-integration clipping. The projection is INSIDE the model.
+    Raw means no EXTRA Q guard or PGS finish, not an unconstrained output head.
+    Guarded halves h until Q does not increase; it may fail to finish.
+    NFE counts endpoint evaluations; backtracking reuses the same endpoint.
     """
     if not isinstance(calls, int) or calls < 1 or max_backtracks < 0:
         raise ValueError("Positive integer calls and nonnegative backtrack limit required")
@@ -81,21 +83,26 @@ def run_cfm(model, problem, start, calls, guarded=False, max_backtracks=12):
     next_h = torch.full_like(elapsed, 1.0 / calls)
     accepted_steps = torch.zeros_like(nfe)
     minimum_h = torch.full_like(elapsed, float("inf"))
-    failure_code = torch.zeros_like(nfe)  # 0=complete, 1=guard, 2=budget, 3=nonfinite
+    failure_code = torch.zeros_like(nfe)  # 0=complete, 1=guard, 2=budget, 3=nonfinite, 4=negative endpoint
     for _ in range(calls * 64):
         active = (elapsed < 1) & ~failed
         if not active.any():
             break
-        h = torch.minimum(1 - elapsed, next_h)
-        rate = model(lam, elapsed, problem)
+        remaining = 1 - elapsed
+        h = (torch.minimum(remaining, next_h) if guarded else
+             ((accepted_steps + 1).to(lam.dtype) / calls).clamp_max(1) - elapsed)
+        endpoint = model.endpoint(lam, elapsed, problem)
         nfe += active.long()
-        invalid = active & ~torch.isfinite(rate).all(-1)
+        nonfinite = ~torch.isfinite(endpoint).all(-1)
+        negative = (endpoint < 0).any(-1)
+        invalid = active & (nonfinite | negative)
         failed |= invalid
-        failure_code = torch.where(invalid, 3, failure_code)
+        failure_code = torch.where(invalid, torch.where(nonfinite, 3, 4), failure_code)
         pending = active & ~invalid
         old_q = value(problem, lam)
         for retry in range(max_backtracks + 1 if guarded else 1):
-            candidate = lam + h[:, None] * rate
+            alpha = (h / remaining.clamp_min(torch.finfo(lam.dtype).tiny)).clamp(0, 1)[:, None]
+            candidate = (1 - alpha) * lam + alpha * endpoint
             candidate_q = value(problem, candidate)
             acceptable = torch.isfinite(candidate).all(-1) & torch.isfinite(candidate_q)
             if guarded:
@@ -120,6 +127,7 @@ def run_cfm(model, problem, start, calls, guarded=False, max_backtracks=12):
     failure_code = torch.where((elapsed < 1) & ~failed, 2, failure_code)
     failed |= elapsed < 1
     return dict(final=lam, completed=~failed, time=elapsed, nfe=nfe,
+                neural_evals=nfe * model.neural_evaluations,
                 backtracks=backtracks, interventions=interventions,
                 accepted_steps=accepted_steps, failure_code=failure_code,
                 min_accepted_h=torch.where(accepted_steps > 0, minimum_h, 0))
