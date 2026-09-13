@@ -3,7 +3,9 @@
 기존 `contact_flow_v2`를 **보존**하고 별도로 추가한 실험이다.
 현재 범위는 **고정 법선·고정 접촉 집합의 최소 이동 projection**이다.
 일반 PBD의 특정 순서가 만든 끝점을 정답으로 강제하지 않는다.
-전체 nonlinear PBD/XPBD 대체, restitution, 마찰, CCD, 물리 rollout은 아직 이 모듈의 범위가 아니다.
+전체 nonlinear PBD/XPBD 대체, restitution, 마찰, CCD는 아직 이 모듈의 범위가 아니다.
+확대 학습과 프레임마다 접촉을 재구성하는 물리 rollout 진단은
+[MULTIPLIER_EXPERIMENTS.md](MULTIPLIER_EXPERIMENTS.md)를 따른다. 내부 solve는 여전히 고정 법선이다.
 
 ## 1. 실험 구성
 
@@ -96,6 +98,8 @@ train/val/test seed는 서로 다르다. 외력 proposal 계산은 기존 모듈
 시작 multiplier는 zero/under/over/mixed/near-equilibrium을 섞는다.
 교란된 시작점에서도 **같은 p**를 유지하고 참조 흐름을 새로 계산한다.
 기본 h는 0.25~256의 log-uniform이고 장면마다 zero-start h=256 label도 있다.
+v2 cache에서는 구간 수가 5보다 커도 다섯 시작 유형이 균형 있게 반복된다.
+확대 설정은 별도의 clock anchor도 혼합한다. 과거 v1 cache는 기존 모델 평가용으로만 읽는다.
 짧은 구간은 의도적으로 미수렴일 수 있다.
 
 `segments_summary.json`은 장면 유형별 최장시간 참조 성공률과 생성 NFE를 기록한다.

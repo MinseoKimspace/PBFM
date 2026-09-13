@@ -120,11 +120,15 @@ def run_map(model, problem, start, total_time, calls, guarded=False, max_backtra
     backtracks, interventions = torch.zeros_like(nfe), torch.zeros_like(nfe)
     failed = torch.zeros(len(start), dtype=torch.bool, device=start.device)
     nominal = total_time / calls
+    next_h = torch.full_like(elapsed, nominal)
+    accepted_steps = torch.zeros_like(nfe)
+    minimum_h = torch.full_like(elapsed, float("inf"))
+    failure_code = torch.zeros_like(nfe)  # 0=complete, 1=retry limit, 2=outer budget
     for _ in range(calls * 64):
         active = (elapsed < total_time) & ~failed
         if not active.any():
             break
-        h = (total_time - elapsed).clamp_max(nominal)
+        h = torch.minimum(total_time - elapsed, next_h)
         pending = active.clone()
         old_q = value(problem, lam)
         for retry in range(max_backtracks + 1 if guarded else 1):
@@ -140,6 +144,10 @@ def run_map(model, problem, start, total_time, calls, guarded=False, max_backtra
             accept = pending & acceptable
             lam = torch.where(accept[:, None], candidate, lam)
             elapsed = torch.where(accept, (elapsed + h).clamp_max(total_time), elapsed)
+            accepted_steps += accept.long()
+            minimum_h = torch.where(accept, torch.minimum(minimum_h, h), minimum_h)
+            # Reuse the last safe clock instead of re-rejecting the nominal h.
+            next_h = torch.where(accept, h, next_h)
             pending &= ~accept
             if not pending.any():
                 break
@@ -148,6 +156,10 @@ def run_map(model, problem, start, total_time, calls, guarded=False, max_backtra
             backtracks += pending.long()
             h = torch.where(pending, h / 2, h)
         failed |= pending
+        failure_code = torch.where(pending, 1, failure_code)
+    failure_code = torch.where((elapsed < total_time) & ~failed, 2, failure_code)
     failed |= elapsed < total_time
     return dict(final=lam, completed=~failed, time=elapsed, nfe=nfe,
-                backtracks=backtracks, interventions=interventions)
+                backtracks=backtracks, interventions=interventions,
+                accepted_steps=accepted_steps, failure_code=failure_code,
+                min_accepted_h=torch.where(accepted_steps > 0, minimum_h, 0))

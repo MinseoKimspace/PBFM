@@ -18,6 +18,7 @@ def main():
     parser.add_argument("--split", choices=("val", "test"), default="test")
     parser.add_argument("--device")
     parser.add_argument("--outdir")
+    parser.add_argument("--checkpoint", choices=("best", "best_solver", "last"), default="best")
     args = parser.parse_args()
     config = load_config(args.config)
     if args.outdir:
@@ -31,7 +32,8 @@ def main():
             raise SystemExit(1)
         return
     selected_device = device(args.device or config["device"])
-    checkpoint = torch.load(root / args.objective / "best.pt", map_location=selected_device, weights_only=True)
+    checkpoint_path = root / args.objective / f"{args.checkpoint}.pt"
+    checkpoint = torch.load(checkpoint_path, map_location=selected_device, weights_only=True)
     if checkpoint.get("format") != "multiplier_map_v1" or checkpoint["objective"] != args.objective:
         raise ValueError("Expected a matching multiplier_map_v1 checkpoint")
     for section in ("model", "physics", "dynamics", "reference", "data", "seed"):
@@ -43,9 +45,10 @@ def main():
     model = MultiplierMap(**config["model"]).to(selected_device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
-    output = root / args.objective / f"eval_{args.split}.json"
+    suffix = "" if args.checkpoint == "best" else f"_{args.checkpoint}"
+    output = root / args.objective / f"eval_{args.split}{suffix}.json"
     evaluate(model, cache["splits"][args.split], config, selected_device, output,
-             metadata=dict(checkpoint=str(root / args.objective / "best.pt"),
+             metadata=dict(checkpoint=str(checkpoint_path),
                            objective=checkpoint["objective"], epoch=checkpoint["epoch"],
                            split=args.split, cache_format=cache["format"]))
     print(f"Saved {output}")

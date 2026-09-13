@@ -42,6 +42,68 @@ def summarize(problem, lam, optimum, tolerance, target=None):
     return report
 
 
+def scene_indices(names, limit=0):
+    """Zero means ALL. A limit uses round-robin groups, never a prefix slice."""
+    if limit < 0:
+        raise ValueError("max_scenes must be nonnegative (0=all)")
+    if not limit or limit >= len(names):
+        return torch.arange(len(names))
+    groups = {}
+    for i, name in enumerate(names):
+        groups.setdefault(name.rsplit("_", 1)[0], []).append(i)
+    order = [group[k] for k in range(max(map(len, groups.values())))
+             for group in groups.values() if k < len(group)]
+    return torch.tensor(order[:limit])
+
+
+def group_summary(rows):
+    groups = {}
+    for row in rows:
+        groups.setdefault(row["name"].rsplit("_", 1)[0], []).append(row)
+    return {name: dict(samples=len(items), success_count=sum(x["success_count"] for x in items),
+                       projected_gradient=sum(x["projected_gradient"] for x in items)/len(items),
+                       max_penetration=max(x["max_penetration"] for x in items),
+                       projection_position_mse=sum(x["projection_position_mse"] for x in items)/len(items))
+            for name, items in groups.items()}
+
+
+def evaluation_start(problem, optimum, mode):
+    if mode == "zero":
+        return torch.zeros_like(optimum)
+    if mode == "over":
+        start = 1.7 * optimum + .01 / problem["D"].diagonal(dim1=1, dim2=2).clamp_min(1e-12)
+    elif mode == "mixed":
+        factor = torch.where(torch.arange(optimum.shape[1], device=optimum.device) % 2 == 0, .4, 1.8)
+        start = optimum * factor
+    else:
+        raise ValueError("start mode must be zero, over or mixed")
+    return start * problem["mask"]
+
+
+@torch.no_grad()
+def solver_validation(model, split, config, device):
+    """Cheap ALL-world raw-map diagnostic; no ODE regeneration/guard/renderer."""
+    settings = config["evaluation"]
+    report, all_rows = {}, []
+    for mode in settings["start_modes"]:
+        rows = []
+        for index in torch.arange(len(split["names"])).split(config["train"]["batch_size"]):
+            problem = move(select(split["problem"], index), device, torch.float32)
+            optimum = split["optimum"][index].to(device=device, dtype=torch.float32)
+            result = run_map(model, problem, evaluation_start(problem, optimum, mode),
+                             settings["total_time"], config["train"].get("validation_calls", 8))
+            for j, context in enumerate(index):
+                rows.append(dict(name=split["names"][int(context)], **summarize(
+                    select(problem, slice(j, j+1)), result["final"][j:j+1],
+                    optimum[j:j+1], settings["tolerance"])))
+        report[mode] = group_summary(rows)
+        all_rows.extend(x for x in rows if not x["name"].startswith("free_flight"))
+    report["nontrivial"] = dict(samples=len(all_rows),
+        success_rate=sum(x["success_count"] for x in all_rows)/max(1, len(all_rows)),
+        mean_projected_gradient=sum(x["projected_gradient"] for x in all_rows)/max(1, len(all_rows)))
+    return report
+
+
 def render_case(problem, start, final, radius, config, path, title):
     if not len(radius):
         return False  # Abstract halfspaces are not circles; do not misrender them.
@@ -137,10 +199,11 @@ def preflight(config, output):
 @torch.no_grad()
 def evaluate(model, split, config, device, output, metadata=None):
     ref, settings = config["reference"], config["evaluation"]
-    count = min(int(settings["max_scenes"]), len(split["names"]))
+    contexts = scene_indices(split["names"], int(settings["max_scenes"]))
+    names = [split["names"][int(i)] for i in contexts]
+    count = len(contexts)
     if count < 1 or settings.get("timing_repeats", 3) < 1:
         raise ValueError("Positive evaluation scene count and timing repeats required")
-    contexts = torch.arange(count)
     problem64 = select(split["problem"], contexts)
     problem = move(problem64, device, torch.float32)
     optimum = split["optimum"][contexts].to(device=device, dtype=torch.float32)
@@ -148,20 +211,13 @@ def evaluate(model, split, config, device, output, metadata=None):
     if any(mode not in {"zero", "over", "mixed"} for mode in modes):
         raise ValueError("Evaluation start_modes must be zero, over or mixed")
     report = dict(scope="Frozen contacts, fixed total time; NO hidden finishing solver",
-                  device=str(device), total_time=settings["total_time"], scenes=split["names"][:count],
+                  device=str(device), total_time=settings["total_time"], scenes=names,
+                  guard_version="reuse_accepted_h_v2",
                   modes={}, timings_include="Solver calls/guards, exclude cached geometry setup and data generation",
                   cost_units="NFE counts logical per-world evaluations; seconds measure the complete batch",
                   config=config, metadata=metadata or {})
     for mode in modes:
-        start64 = split["optimum"][contexts].clone()
-        if mode == "zero":
-            start64.zero_()
-        elif mode == "over":
-            start64 = 1.7 * start64 + 0.01 / problem64["D"].diagonal(dim1=1, dim2=2).clamp_min(1e-12)
-        else:
-            factor = torch.where(torch.arange(start64.shape[1]) % 2 == 0, 0.4, 1.8)
-            start64 *= factor
-        start64 *= problem64["mask"]
+        start64 = evaluation_start(problem64, split["optimum"][contexts], mode)
         label = reference(problem64, start64, settings["total_time"], ref["rtol"], ref["atol"], ref["max_steps"])["final"]
         start, target = start64.to(device=device, dtype=torch.float32), label.to(device=device, dtype=torch.float32)
         label_quality = summarize(problem64, label, split["optimum"][contexts], settings["tolerance"])
@@ -190,13 +246,19 @@ def evaluate(model, split, config, device, output, metadata=None):
                 if key in result:
                     row[key] = int(result[key].sum())
             row["completed_count"] = int(result["completed"].sum()) if "completed" in result else count
-            row["per_scene"] = [dict(name=split["names"][i], **summarize(
+            row["per_scene"] = [dict(name=names[i], **summarize(
                 select(problem, slice(i, i+1)), result["final"][i:i+1], optimum[i:i+1],
                 settings["tolerance"], target[i:i+1])) for i in range(count)]
+            for i, scene in enumerate(row["per_scene"]):
+                for key in ("completed", "time", "nfe", "backtracks", "interventions",
+                            "accepted_steps", "min_accepted_h", "failure_code"):
+                    if key in result:
+                        scene[key] = result[key][i].item()
+            row["groups"] = group_summary(row["per_scene"])
             rows[name] = row
             if settings["render"] and mode == "zero":
                 render_case(select(problem, slice(0, 1)), start[:1], result["final"][:1],
-                            split["radii"][0], config, Path(output).parent / "renders" / f"{name}.png", name)
+                            split["radii"][int(contexts[0])], config, Path(output).parent / "renders" / f"{name}.png", name)
         report["modes"][mode] = rows
         report.setdefault("float64_label_quality", {})[mode] = label_quality
     write_json(output, report)

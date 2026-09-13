@@ -6,8 +6,8 @@ from pathlib import Path
 import torch
 from torch.func import jvp
 
-from src.multiplier_flow.data import prepare, release_problem
-from src.multiplier_flow.evaluation import evaluate, preflight, relinearization_check
+from src.multiplier_flow.data import prepare, release_problem, sample_segments
+from src.multiplier_flow.evaluation import evaluate, preflight, relinearization_check, scene_indices
 from src.multiplier_flow.model import MultiplierMap, losses
 from src.multiplier_flow.problem import (converged, decode, field, gap, make_problem,
                                          pack, position_error, residuals, select, value)
@@ -198,6 +198,41 @@ class ModelTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_balanced_32_segments_and_fixed_anchor(self):
+        p = pack([release_problem(), release_problem(.08, .25)])
+        optimum = pgs(p, torch.zeros_like(p["c"]), 1e-10)["final"]
+        original = p["p"].clone()
+        settings = dict(segments_per_scene=32, h_range=[.25, 256.],
+                        time_anchors=[32., 64., 128., 256.], anchor_fraction=1.)
+        result = sample_segments(p, optimum, settings, torch.Generator().manual_seed(2))
+        for modes in result["start_mode"].reshape(2, 32):
+            counts = torch.bincount(modes, minlength=5)
+            self.assertLessEqual(int(counts.max()-counts.min()), 1)
+        self.assertEqual(int(result["horizon_check"].sum()), 2)
+        self.assertTrue((result["duration"][result["horizon_check"]] == 256).all())
+        self.assertTrue((result["start"] >= 0).all())
+        self.assertEqual(set(result["duration"].tolist()), {32., 64., 128., 256.})
+        torch.testing.assert_close(p["p"], original)
+
+    def test_scene_limits_do_not_take_prefix_and_zero_means_all(self):
+        names = [f"stack_{i}" for i in range(8)] + [f"release_{i}" for i in range(4)]
+        selected = scene_indices(names, 4)
+        self.assertTrue(any(names[int(i)].startswith("release") for i in selected))
+        self.assertEqual(len(scene_indices(names, 0)), 12)
+
+    def test_exact_update_budget_and_solver_checkpoint(self):
+        from train_multiplier import train
+        config = tiny_config()
+        config["data"]["h_range"][1] = 256.
+        config["train"].update(max_updates=3, solver_validation_every=2, validation_calls=1)
+        with tempfile.TemporaryDirectory() as directory:
+            config["outdir"] = directory
+            result = train(config, "map", torch.device("cpu"))
+            self.assertEqual(result["updates"], 3)
+            checkpoint = torch.load(Path(directory)/"map"/"last.pt", weights_only=True)
+            self.assertEqual(checkpoint["updates"], 3)
+            self.assertTrue((Path(directory)/"map"/"best_solver.pt").exists())
+
     def test_both_training_arms_and_evaluation(self):
         from train_multiplier import train
         config = tiny_config()
