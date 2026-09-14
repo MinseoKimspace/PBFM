@@ -1,0 +1,30 @@
+# NO training, checkpoint, pair-cache preparation, or arc-length remapping.
+cpu_threads: 1
+device: cpu
+outdir: runs/multiplier_homotopy_preflight
+physics:
+  y_ground: 0.0
+  xy_limit: 10.0
+  slop: 0.005
+  contact_margin: 0.25
+  density: 1.0
+reference:
+  eta_fraction: 0.9
+  max_sweeps: 10000
+homotopy_preflight:
+  stack_sizes: [3, 5, 8, 10]
+  initializations: [epsilon, diagonal_scaled, isolated_root]
+  schedules: [linear, geometric]
+  gap_scale: 0.1
+  mu0_factors: [1.0]          # Optional separate scale scan: [0.1, 1.0, 10.0].
+  mu_min_ratio: 0.000001
+  epsilon_ratio: 0.000001    # Bad-scale control, NOT a proposed default solver.
+  kappa: 4.0
+  reference_points: 65       # Uniform ORIGINAL time, Newton roots at each point.
+  reference_tolerance: 0.000000001  # max(abs(H))/gap_scale; NOT KKT tolerance.
+  tolerance: 0.001           # Actual QP KKT/penetration success criterion.
+  calls: [4, 8, 16, 32]
+  guard_max_nfe_multiplier: 64  # Guarded calls may exceed K; all are counted.
+  recovery_steps: 512        # Accurate recovery CHECK, not the candidate's K budget.
+  log_perturbation: 0.35     # Multiplicative +/- perturbation; keep original r0.
+  recovery_relative_tolerance: 0.001

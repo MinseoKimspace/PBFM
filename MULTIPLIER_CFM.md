@@ -1,5 +1,15 @@
 # Contact-structured Conditional Flow Matching (v2)
 
+> **지금 진행할 실험은 별도의 비학습 homotopy preflight다.**
+> 초기값 스케일링 + 선형/기하 μ 비교이며, 아래 기존 CFM 학습을 바꾸지 않는다.
+> 상세 설정·결과 해석은 [HOMOTOPY_PREFLIGHT.md](HOMOTOPY_PREFLIGHT.md)를 참고한다.
+>
+> ```powershell
+> python eval_multiplier.py --config configs/multiplier_homotopy_preflight.yaml --homotopy-preflight --device cpu
+> ```
+>
+> 이 검증을 위해 `--prepare-only`나 학습 명령을 다시 실행할 필요는 없다.
+
 ## 1. 이번에 바꾼 것
 
 기존 raw CFM v1은 PGS가 만든 정답을 학습했지만, 추론에서는 자유로운
