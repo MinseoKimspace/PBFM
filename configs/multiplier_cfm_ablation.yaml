@@ -1,10 +1,10 @@
-# One shared dataset for the A/B/C/D ablation. Select with --variant.
+# Shared A/B/C/D training configuration for RTX A6000. Select with --variant.
 seed: 42
 device: auto
 cpu_threads: 1
 outdir: runs/multiplier_cfm_ablation
 cache_dir: runs/multiplier_cfm_ablation/shared_data
-variant: A
+variant: D
 physics:
   y_ground: 0.0
   xy_limit: 10.0
@@ -24,31 +24,32 @@ data:
   train_sizes: [3, 5, 8, 10]
   val_sizes: [3, 5, 8, 10]
   test_sizes: [3, 5, 8, 10]
-  train_per_size: 64
-  val_per_size: 16
-  test_per_size: 16
-  release_count: 16
-  floor_count: 16
-  sources_per_scene: 12
-  reference_batch_size: 128
+  train_per_size: 2048
+  val_per_size: 128
+  test_per_size: 128
+  # Auxiliary scene counts apply separately to every split.
+  release_count: 128
+  floor_count: 128
+  sources_per_scene: 24       # Four samples per each of the six source modes.
+  reference_batch_size: 256  # CPU float64 labels; independent of GPU batch size.
 model:
   hidden_dim: 64
   message_steps: 3
   length_scale: 0.1
   feature_version: residual
-  communication: local      # B/D/D_recovery select global communication.
+  communication: global     # A/C select local communication.
   attention_heads: 4
   attention_layers: 2
 train:
-  epochs: 100
-  max_updates: 3000
-  batch_size: 128
+  epochs: 76                 # Fallback only; max_updates controls the default run.
+  max_updates: 30000
+  batch_size: 512
   lr: 0.0003
   weight_decay: 0.0001
   grad_clip: 1.0
   tau_zero_fraction: 0.1
   tau_min_remaining: 0.001
-  solver_validation_every: 300
+  solver_validation_every: 1000  # Checked at epoch boundaries (396 updates/epoch).
   validation_calls: [1, 2, 4]
   inner_rollout:
     weight: 1.0             # A/B disable this; C/D enable it.

@@ -26,9 +26,9 @@ CFM·analytic head·접촉 후보·학습 데이터·기본 입력 특징은 네
 현재 검사는 **학습에 포함된 크기에서 새로운 장면을 푸는 능력**을 측정한다.
 더 큰 물체 수로의 일반화는 별도 실험이 필요하다.
 
-기본 규모는 train 288개 QP/3,456개 source-target 쌍,
-val/test 각각 96개 QP/1,152개 쌍이다. 각 split에 floor 16개, release 16개 문제가 포함된다.
-학습 예산은 3,000 optimizer updates다. 충분히 학습된 최종 성능을 보장하는 설정은 아니다.
+기본 규모는 train 8,448개 QP/202,752개 source-target 쌍,
+val/test 각각 768개 QP/18,432개 쌍이다. 각 split에 floor 128개, release 128개 문제가 포함된다.
+학습 예산은 배치 512로 30,000 optimizer updates다. 충분히 학습된 최종 성능을 보장하는 설정은 아니다.
 Rollout 학습은 update당 계산량이 더 크므로 업데이트 수와 학습 시간을 함께 비교한다.
 
 ## 2. 고정 접촉 문제와 analytic head
@@ -196,6 +196,42 @@ python eval_multiplier.py --config configs/multiplier_cfm_ablation.yaml --varian
 `--prepare-pilot`은 별도의 작은 데이터 준비 검사에 사용할 수 있다.
 기존 `configs/multiplier_cfm.yaml`, `configs/multiplier_cfm_large.yaml`과 그 결과 경로는 유지한다.
 새 checkpoint는 v3 형식이며, 모델 구조가 다른 checkpoint의 혼용을 검사한다.
+
+### 통합 학습 설정
+
+A6000용 학습값도 `configs/multiplier_cfm_ablation.yaml` 한 파일에서 관리한다.
+기본 variant는 전역 통신과 inner rollout을 사용하는 D다. 같은 설정에서
+`--variant A/B/C/D`로 비교하며, 결과와 공통 cache는 `runs/multiplier_cfm_ablation`에 저장한다.
+
+| 항목 | 설정 |
+|---|---:|
+| GPU batch size | 512 |
+| Optimizer updates | 30,000 |
+| 크기별 학습 장면 | 2,048 |
+| 크기별 val/test 장면 | 128 |
+| 각 split의 floor / release 장면 | 128 / 128 |
+| 장면당 source 수 | 24 |
+| CPU 정답 생성 batch size | 256 |
+| Solver validation 간격 | 1,000 updates |
+| AdamW learning rate | 3e-4 |
+
+한 epoch는 396 updates이며 30,000 updates는 약 75.76 epochs다.
+`max_updates`가 기본 학습 길이를 결정하고, 명시적인 `--epochs`는 이를 덮어쓴다.
+CFM validation은 매 epoch, solver validation은 첫 epoch·마지막 update와
+직전 검사 이후 1,000 updates 이상이 지난 epoch 끝에서 실행한다.
+
+빠른 추론이라는 목표를 유지하도록 hidden dimension 64와 메시지/attention 층 수는 그대로다.
+CFM·inner·recovery loss 가중치, FP32 학습과 학습률도 유지한다.
+배치 2,048은 소규모 장면의 GPU 메모리 검사만 통과했으며 수렴 성능은 검증하지 않았다.
+현재 기본 배치는 512다. 30,000 updates에서 총 15,360,000개 학습 쌍을 처리한다.
+이는 배치 2,048의 같은 update 예산에서 처리하는 양의 1/4이다.
+배치를 늘릴 때는 메모리뿐 아니라 검증 solver 성공률과 실제 학습 시간을 함께 비교한다.
+A6000 실기기의 메모리와 속도는 앞 절의 `--profile-only` 명령으로 확인한다.
+`D_recovery`는 CFM 1회 + inner 최대 4회 + recovery 4회의 역전파를 포함한다.
+
+Profile 결과는 해당 variant 폴더의 `profile_cfm.json`에 기록된다.
+Profile은 고정 tau와 초기 가중치에서의 측정이며 전체 학습의 메모리 상한은 아니다.
+비교 variant는 같은 배치 크기를 사용하고, 처리한 학습 쌍 수와 실행 설정을 함께 기록한다.
 
 ## 7. 평가와 해석
 
