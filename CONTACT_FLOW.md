@@ -1,6 +1,6 @@
 # Contact-energy path FM v2
 
-별도 추가 실험: [누적 multiplier flow-map A/B/C](MULTIPLIER_FLOW.md).
+현재 multiplier solver 실험: [Contact-structured CFM과 전역 통신·rollout 비교](MULTIPLIER_CFM.md).
 새 실험은 `train_multiplier.py` / `eval_multiplier.py`를 사용하며,
 아래의 v2 구현·설정·체크포인트는 그대로 유지합니다.
 

@@ -11,7 +11,9 @@ import torch
 from src.contact_flow.io import device, load_config
 from src.multiplier_flow.data import batch, cache_summary, prepare
 from src.multiplier_flow.evaluation import solver_validation, timed, write_json
+from src.multiplier_flow.experiment import VARIANTS, pair_cache_path, resolve_experiment
 from src.multiplier_flow.model import CHECKPOINT_FORMAT, SOLVER_DESCRIPTION, ConditionalField, cfm_loss
+from src.multiplier_flow.training import training_objective, validate_objectives
 
 
 def sample_tau(count, rng, zero_fraction, min_remaining=0.001):
@@ -24,18 +26,24 @@ def sample_tau(count, rng, zero_fraction, min_remaining=0.001):
     return tau
 
 
-def profile(model, example, selected_device):
+def profile(model, example, selected_device, settings=None):
+    """Measure the complete configured training loss, including all unrolls."""
+    settings = settings or {}
     tau = example[1].new_full((len(example[1]),), .5)
     def operation():
         model.zero_grad(set_to_none=True)
-        loss, _ = cfm_loss(model, *example, tau)
+        rng = torch.Generator().manual_seed(0)
+        loss, _, costs = training_objective(model, *example, tau, settings, rng)
         loss.backward()
+        return costs
     operation()
     if selected_device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(selected_device)
-    times = [timed(selected_device, operation)[1] for _ in range(3)]
+    measurements = [timed(selected_device, operation) for _ in range(3)]
     model.zero_grad(set_to_none=True)
-    return dict(forward_backward_seconds=sum(times)/len(times),
+    return dict(forward_backward_seconds=sum(item[1] for item in measurements)/len(measurements),
+                profiled_rollout_calls=measurements[-1][0],
+                parameters=sum(parameter.numel() for parameter in model.parameters()),
                 peak_allocated_bytes=(torch.cuda.max_memory_allocated(selected_device)
                                       if selected_device.type == "cuda" else None),
                 derivatives="first-order parameter gradients; no JVP or spatial Hessian")
@@ -56,19 +64,25 @@ def validate(model, split, batch_size, selected_device, seed, zero_fraction, min
 def train(config, selected_device, *, prepare_only=False, profile_only=False,
           epochs=None, max_updates=None):
     torch.set_num_threads(int(config["cpu_threads"]))
+    settings = config["train"]
+    validate_objectives(settings)
+    validation_calls = settings["validation_calls"]
+    validation_budgets = validation_calls if isinstance(validation_calls, list) else [validation_calls]
+    if not validation_budgets or any(type(k) is not int or k < 1 for k in validation_budgets):
+        raise ValueError("validation_calls must be a positive integer or nonempty list of positive integers")
     root = Path(config["outdir"])
     run = root / "cfm"
     if not prepare_only and not profile_only and any((run / name).exists() for name in ("best.pt", "last.pt", "best_solver.pt")):
         raise FileExistsError(f"Refusing to overwrite {run}; choose a new outdir")
-    cache = prepare(config, root / "pairs.pt")
+    cache_path = pair_cache_path(config)
+    cache = prepare(config, cache_path)
     summary = cache_summary(cache, config["evaluation"]["tolerance"])
     write_json(root / "pairs_summary.json", summary)
     if prepare_only:
-        return dict(cache=str(root / "pairs.pt"), summary=summary)
+        return dict(cache=str(cache_path), summary=summary)
     if any(summary[s]["solved"] != summary[s]["scenes"] for s in ("train", "val")):
         raise RuntimeError("QP labels miss train/val tolerance; inspect pairs_summary.json")
-    settings = config["train"]
-    if min(settings["epochs"], settings["batch_size"], settings["solver_validation_every"], settings["validation_calls"]) < 1:
+    if min(settings["epochs"], settings["batch_size"], settings["solver_validation_every"]) < 1:
         raise ValueError("Positive epochs, batch size and validation budgets required")
     if epochs is not None and epochs < 1:
         raise ValueError("Positive epochs required")
@@ -82,7 +96,7 @@ def train(config, selected_device, *, prepare_only=False, profile_only=False,
     model = ConditionalField(**config["model"]).to(selected_device)
     training, validation = cache["splits"]["train"], cache["splits"]["val"]
     example = batch(training, torch.arange(min(settings["batch_size"], len(training["context"]))), selected_device)
-    profiling = profile(model, example, selected_device)
+    profiling = profile(model, example, selected_device, settings)
     write_json(root / "profile_cfm.json", dict(device=str(selected_device), costs=profiling,
                                              solver=SOLVER_DESCRIPTION, format=CHECKPOINT_FORMAT))
     if profile_only:
@@ -98,35 +112,46 @@ def train(config, selected_device, *, prepare_only=False, profile_only=False,
     history, best, best_solver = [], float("inf"), (float("inf"), float("inf"))
     updates, last_diagnostic = 0, 0
     began = perf_counter()
+    training_seconds = 0.0
     for epoch in range(math.ceil(budget / batches)):
         model.train()
         order_rng = torch.Generator().manual_seed(config["seed"] + epoch)
         tau_rng = torch.Generator().manual_seed(config["seed"] + 100000 + epoch)
-        total, endpoint, seen = 0., 0., 0
+        rollout_rng = torch.Generator().manual_seed(config["seed"] + 300000 + epoch)
+        totals, seen = {}, 0
+        endpoint_evaluations = 0
+        budget_counts = {}
+        epoch_began = perf_counter()
         for indices in torch.randperm(count, generator=order_rng).split(settings["batch_size"]):
             tau = sample_tau(len(indices), tau_rng, zero_fraction, min_remaining).to(selected_device)
-            loss, mse = cfm_loss(model, *batch(training, indices, selected_device), tau)
+            loss, terms, costs = training_objective(
+                model, *batch(training, indices, selected_device), tau, settings, rollout_rng)
             if not torch.isfinite(loss):
-                raise FloatingPointError("Nonfinite CFM loss; checkpoint not updated")
+                raise FloatingPointError("Nonfinite training loss; checkpoint not updated")
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), settings["grad_clip"], error_if_nonfinite=True)
             optimizer.step()
             updates += 1
             seen += len(indices)
-            total += float(loss.detach()) * len(indices)
-            endpoint += float(mse) * len(indices)
+            for name, term in terms.items():
+                totals[name] = totals.get(name, 0.0) + float(term) * len(indices)
+            endpoint_evaluations += len(indices) * (1 + costs["inner_calls"] + costs["recovery_calls"])
+            key = str(costs["inner_calls"])
+            budget_counts[key] = budget_counts.get(key, 0) + 1
             if updates >= budget:
                 break
+        training_seconds += perf_counter() - epoch_began
         model.eval()
         val = validate(model, validation, settings["batch_size"], selected_device,
                        config["seed"] + 200000, zero_fraction, min_remaining)
         if not all(math.isfinite(x) for x in val.values()):
             raise FloatingPointError("Nonfinite validation metrics")
-        row = dict(epoch=epoch+1, updates=updates, train_cfm=total/seen,
-                   train_endpoint_estimate_mse=endpoint/seen, val_cfm=val["cfm"],
+        row = dict(epoch=epoch+1, updates=updates,
+                   **{f"train_{name}": value/seen for name, value in totals.items()}, val_cfm=val["cfm"],
                    val_endpoint_estimate_mse=val["endpoint_estimate_mse"],
-                   elapsed_seconds=perf_counter()-began)
+                   elapsed_seconds=perf_counter()-began, training_seconds=training_seconds,
+                   training_endpoint_evaluations=endpoint_evaluations, inner_budget_updates=budget_counts)
         diagnostic = (updates-last_diagnostic >= settings["solver_validation_every"]
                       or updates == budget or epoch == 0)
         if diagnostic:
@@ -150,7 +175,8 @@ def train(config, selected_device, *, prepare_only=False, profile_only=False,
                     selection_metric="group-balanced raw validation success, then PG residual",
                     solver_validation=row["solver_validation"]), run / "best_solver.pt")
         write_json(run / "history.json", history)
-        print(f"[{epoch+1:03d} updates={updates}/{budget}] cfm={total/seen:.6g} "
+        print(f"[{epoch+1:03d} updates={updates}/{budget}] loss={totals['total']/seen:.6g} "
+              f"cfm={totals['cfm']/seen:.6g} "
               f"val_cfm={val['cfm']:.6g} endpoint_estimate_mse={val['endpoint_estimate_mse']:.6g}", flush=True)
         if diagnostic:
             print(f"  balanced solver validation: {stats}", flush=True)
@@ -162,6 +188,7 @@ def main():
     parser.add_argument("--config", default="configs/multiplier_cfm.yaml")
     parser.add_argument("--device")
     parser.add_argument("--outdir")
+    parser.add_argument("--variant", choices=VARIANTS, help="Controlled communication/rollout ablation")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--max-updates", type=int)
     modes = parser.add_mutually_exclusive_group()
@@ -169,13 +196,13 @@ def main():
     modes.add_argument("--prepare-pilot", type=int, metavar="SCENES_PER_SIZE")
     modes.add_argument("--profile-only", action="store_true")
     args = parser.parse_args()
-    config = load_config(args.config)
-    if args.outdir:
-        config["outdir"] = args.outdir
+    config = resolve_experiment(load_config(args.config), args.variant, args.outdir)
     if args.prepare_pilot is not None:
         if args.prepare_pilot < 1:
             parser.error("--prepare-pilot must be positive")
         config["outdir"] = str(Path(config["outdir"]) / "prepare_pilot")
+        # Pilot data must never replace or collide with the shared full dataset.
+        config["cache_dir"] = str(Path(config.get("cache_dir", config["outdir"])) / "prepare_pilot")
         for split in ("train", "val", "test"):
             key = split + "_per_size"
             config["data"][key] = min(config["data"][key], args.prepare_pilot)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from time import perf_counter
 
@@ -82,6 +83,19 @@ def evaluation_start(problem, optimum, mode):
 @torch.no_grad()
 def solver_validation(model, split, config, device):
     """ALL-world raw CFM diagnostic, grouped so release counts cannot dominate."""
+    budgets = config["train"]["validation_calls"]
+    if isinstance(budgets, list):
+        if not budgets or any(type(k) is not int or k < 1 for k in budgets) or len(set(budgets)) != len(budgets):
+            raise ValueError("Validation budgets must be distinct positive integers")
+        reports = {}
+        for calls in budgets:
+            single = deepcopy(config)
+            single["train"]["validation_calls"] = calls
+            reports[str(calls)] = solver_validation(model, split, single, device)
+        return dict(by_calls=reports, selection="Equal weight per NFE budget and scene/source group",
+            balanced=dict(groups=sum(report["balanced"]["groups"] for report in reports.values()),
+                success_rate=sum(report["balanced"]["success_rate"] for report in reports.values())/len(reports),
+                mean_projected_gradient=sum(report["balanced"]["mean_projected_gradient"] for report in reports.values())/len(reports)))
     settings = config["evaluation"]
     report, all_rows = {}, []
     for mode in settings["start_modes"]:
@@ -242,7 +256,7 @@ def evaluate(model, split, config, device, output, metadata=None):
     optimum64 = split["optimum"][contexts]
     optimum = optimum64.to(device=device, dtype=torch.float32)
     report = dict(scope=SOLVER_DESCRIPTION,
-                  model_format=CHECKPOINT_FORMAT,
+                  model_format=getattr(model, "checkpoint_format", CHECKPOINT_FORMAT),
                   device=str(device), tau_interval=[0., 1.], integrator="convex-combination Euler", scenes=names,
                   raw_definition="Analytic contact projection is in the head; no EXTRA guard/finish",
                   local_definition="No neural coupling; same projected endpoint and tau schedule, not native Jacobi",
@@ -294,5 +308,8 @@ def evaluate(model, split, config, device, output, metadata=None):
                 render_case(select(problem, slice(0, 1)), start[:1], result["final"][:1],
                             split["radii"][int(contexts[0])], config, Path(output).parent / "renders" / f"{name}.png", name)
         report["modes"][mode] = rows
+    if settings.get("recovery", {}).get("enabled", False):
+        from .recovery import recovery_evaluation
+        report["recovery"] = recovery_evaluation(model, split, config, device)
     write_json(output, report)
     return report

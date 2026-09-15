@@ -6,6 +6,7 @@ import torch
 
 from src.contact_flow.io import device, load_config
 from src.multiplier_flow.model import load_model
+from src.multiplier_flow.experiment import VARIANTS, resolve_experiment
 from src.multiplier_flow.rollout import evaluate_motion
 
 
@@ -16,14 +17,13 @@ def main():
     parser.add_argument("--checkpoint", choices=("best", "best_solver", "last"), default="best_solver")
     parser.add_argument("--device")
     parser.add_argument("--outdir", help="Checkpoint root")
+    parser.add_argument("--variant", choices=VARIANTS)
     parser.add_argument("--steps", type=int, help="Physical frames, not CFM integration steps")
     parser.add_argument("--guarded", action="store_true")
     parser.add_argument("--no-render", action="store_true")
     parser.add_argument("--output", help="Use a new report directory")
     args = parser.parse_args()
-    config = load_config(args.config)
-    if args.outdir:
-        config["outdir"] = args.outdir
+    config = resolve_experiment(load_config(args.config), args.variant, args.outdir)
     if args.steps is not None:
         config["rollout"]["steps"] = args.steps
     if args.guarded:

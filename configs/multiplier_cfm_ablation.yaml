@@ -1,0 +1,93 @@
+# One shared dataset for the A/B/C/D ablation. Select with --variant.
+seed: 42
+device: auto
+cpu_threads: 1
+outdir: runs/multiplier_cfm_ablation
+cache_dir: runs/multiplier_cfm_ablation/shared_data
+variant: A
+physics:
+  y_ground: 0.0
+  xy_limit: 10.0
+  slop: 0.005
+  contact_margin: 0.25
+  density: 1.0
+dynamics:
+  time_step: 0.0166666667
+  gravity_y: -9.8
+  linear_damping: 0.1
+reference:
+  eta_fraction: 0.9
+  qp_tolerance: 0.0000001
+  max_sweeps: 10000
+data:
+  # All sizes occur in training; split seeds generate held-out scenes.
+  train_sizes: [3, 5, 8, 10]
+  val_sizes: [3, 5, 8, 10]
+  test_sizes: [3, 5, 8, 10]
+  train_per_size: 64
+  val_per_size: 16
+  test_per_size: 16
+  release_count: 16
+  floor_count: 16
+  sources_per_scene: 12
+  reference_batch_size: 128
+model:
+  hidden_dim: 64
+  message_steps: 3
+  length_scale: 0.1
+  feature_version: residual
+  communication: local      # B/D/D_recovery select global communication.
+  attention_heads: 4
+  attention_layers: 2
+train:
+  epochs: 100
+  max_updates: 3000
+  batch_size: 128
+  lr: 0.0003
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  tau_zero_fraction: 0.1
+  tau_min_remaining: 0.001
+  solver_validation_every: 300
+  validation_calls: [1, 2, 4]
+  inner_rollout:
+    weight: 1.0             # A/B disable this; C/D enable it.
+    calls: [1, 2, 4]         # Sample one budget uniformly per update.
+    residual_weight: 1.0
+    position_weight: 1.0
+  recovery:
+    weight: 0.0             # Only D_recovery enables weight 1.0.
+    enabled_weight: 1.0     # Weight selected by --variant D_recovery.
+    calls: 4
+    amplitude: 0.1
+    kinds: [independent, correlated]
+preflight:
+  stack_sizes: [3, 5, 8, 10]
+evaluation:
+  calls: [1, 2, 4, 8, 16]
+  tolerance: 0.001
+  max_scenes: 0
+  start_modes: [zero, over, mixed]
+  guarded: false
+  max_backtracks: 12
+  timing_repeats: 3
+  render: true
+  image_size: 900
+  recovery:
+    enabled: true
+    max_scenes: 16
+    calls: [2, 4]
+    amplitudes: [0.1]
+    start_fractions: [0.5]
+    kinds: [independent, correlated]
+    seed: 12345
+rollout:
+  steps: 300
+  calls: [1, 2, 4]
+  guarded: false
+  max_backtracks: 8
+  frame_stride: 3
+  image_size: 480
+  render: true
+  max_speed: 100.0
+  max_position: 100.0

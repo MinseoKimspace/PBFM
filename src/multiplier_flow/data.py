@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 from time import perf_counter
 
 import torch
@@ -101,6 +102,34 @@ def build_split(config, split):
 
 
 def prepare(config, path):
+    """Reuse a complete cache or acquire exclusive ownership of preparation.
+
+    Ablation variants share this path. A second writer fails clearly instead
+    of replacing another process's partial cache. Completed caches are atomic
+    and remain readable while training variants run concurrently.
+    """
+    path = Path(path)
+    if path.exists():
+        return _prepare_cache(config, path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    try:
+        lock = lock_path.open("x", encoding="utf-8")
+    except FileExistsError as error:
+        raise RuntimeError(
+            f"Another process is preparing {path}; finish --prepare-only before starting variants. "
+            f"If preparation crashed, confirm no writer is active before removing {lock_path}."
+        ) from error
+    try:
+        with lock:
+            lock.write(f"pid={os.getpid()}\n")
+        return _prepare_cache(config, path)
+    finally:
+        lock_path.unlink()
+
+
+def _prepare_cache(config, path):
+    """Atomic cache writes; caller owns the preparation lock for a new cache."""
     path = Path(path)
     spec = {key: config[key] for key in ("seed", "data", "physics", "dynamics", "reference")}
     if path.exists():

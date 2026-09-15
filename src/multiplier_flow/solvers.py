@@ -1,4 +1,4 @@
-"""PGS labels/baseline and structure-preserving Euler for contact CFM."""
+"""PGS reference and a shared, differentiable Euler update for contact CFM."""
 from __future__ import annotations
 
 from itertools import combinations
@@ -6,6 +6,51 @@ from itertools import combinations
 import torch
 
 from .problem import converged, gap, value
+
+
+def advance_endpoint(state, endpoint, time, step_size):
+    """Euler for u=(endpoint-state)/(1-time), without dividing the field.
+
+    The training integrator and the diagnostic inference driver both use this
+    update. The caller supplies 0 <= step_size <= 1-time. Clamping only guards
+    clock roundoff; it does not project the predicted state or solve the QP.
+    """
+    remaining = (1 - time).clamp_min(torch.finfo(state.dtype).tiny)
+    fraction = (step_size / remaining).clamp(0, 1).reshape(-1, 1)
+    return (1 - fraction) * state + fraction * endpoint
+
+
+def cfm_step(model, problem, state, time, next_time):
+    """One autograd-preserving step; geometry and the original QP stay fixed."""
+    time = torch.as_tensor(time, dtype=state.dtype, device=state.device).expand(len(state))
+    next_time = torch.as_tensor(next_time, dtype=state.dtype, device=state.device).expand(len(state))
+    endpoint = model.endpoint(state, time, problem)
+    return advance_endpoint(state, endpoint, time, next_time - time)
+
+
+def integrate_cfm(model, problem, start, calls, *, start_step=0, end_step=None,
+                  return_trajectory=False):
+    """Integrate any contiguous part of the ORIGINAL uniform [0,1] clock.
+
+    `calls` always means the full-interval budget. For example, calls=4 and
+    start_step=2 performs two calls at t=.5,.75, rather than restarting at zero.
+    No state is detached. Use torch.no_grad() outside this function for eval.
+    A returned trajectory includes the supplied initial state as its first row.
+    Raw inference and training have no early stop, guard, or hidden PGS finish.
+    """
+    end_step = calls if end_step is None else end_step
+    if (type(calls) is not int or calls < 1 or type(start_step) is not int
+            or type(end_step) is not int or not 0 <= start_step <= end_step <= calls):
+        raise ValueError("Require integer 0 <= start_step <= end_step <= calls, calls > 0")
+    if start.shape != problem["c"].shape:
+        raise ValueError("Multiplier state must match the padded contact shape")
+    state = start
+    trajectory = [state] if return_trajectory else None
+    for step in range(start_step, end_step):
+        state = cfm_step(model, problem, state, step / calls, (step + 1) / calls)
+        if trajectory is not None:
+            trajectory.append(state)
+    return torch.stack(trajectory) if trajectory is not None else state
 
 
 @torch.no_grad()
@@ -101,8 +146,7 @@ def run_cfm(model, problem, start, calls, guarded=False, max_backtracks=12):
         pending = active & ~invalid
         old_q = value(problem, lam)
         for retry in range(max_backtracks + 1 if guarded else 1):
-            alpha = (h / remaining.clamp_min(torch.finfo(lam.dtype).tiny)).clamp(0, 1)[:, None]
-            candidate = (1 - alpha) * lam + alpha * endpoint
+            candidate = advance_endpoint(lam, endpoint, elapsed, h)
             candidate_q = value(problem, candidate)
             acceptable = torch.isfinite(candidate).all(-1) & torch.isfinite(candidate_q)
             if guarded:

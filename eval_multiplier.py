@@ -7,41 +7,26 @@ import torch
 from src.contact_flow.io import device, load_config
 from src.multiplier_flow.data import prepare
 from src.multiplier_flow.evaluation import evaluate, preflight
+from src.multiplier_flow.experiment import VARIANTS, pair_cache_path, resolve_experiment
 from src.multiplier_flow.model import load_model
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="configs/multiplier_cfm.yaml")
-    checks = parser.add_mutually_exclusive_group()
-    checks.add_argument("--preflight", action="store_true")
-    checks.add_argument("--homotopy-preflight", action="store_true",
-                        help="Non-learning initialization/mu-clock study; use multiplier_homotopy_preflight.yaml")
+    parser.add_argument("--preflight", action="store_true")
     parser.add_argument("--split", choices=("val", "test"), default="test")
     parser.add_argument("--device")
     parser.add_argument("--outdir")
+    parser.add_argument("--variant", choices=VARIANTS)
     parser.add_argument("--guarded", action="store_true", help="Also evaluate the explicit Q/nonnegativity guard")
     parser.add_argument("--checkpoint", choices=("best", "best_solver", "last"), default="best_solver")
     args = parser.parse_args()
-    config = load_config(args.config)
-    if args.outdir:
-        config["outdir"] = args.outdir
+    config = resolve_experiment(load_config(args.config), args.variant, args.outdir)
     if args.guarded:
         config["evaluation"]["guarded"] = True
     torch.set_num_threads(int(config["cpu_threads"]))
     root = Path(config["outdir"])
-    if args.homotopy_preflight:
-        if (args.device or config.get("device", "cpu")) != "cpu":
-            parser.error("Homotopy preflight uses CPU float64 for all comparisons; use --device cpu")
-        if "homotopy_preflight" not in config:
-            parser.error("Use --config configs/multiplier_homotopy_preflight.yaml")
-        from src.multiplier_flow.homotopy_preflight import preflight as homotopy_preflight
-        output = root / "homotopy_preflight.json"
-        result = homotopy_preflight(config, output)
-        print(f"Saved {output}")
-        print(f"Scaled geometric reference-ready variants: {len(result['reference_ready_variants'])}")
-        print(f"Uniform-budget ready: {result['ready_for_learning']} (diagnostic only; training unchanged)")
-        return
     if args.preflight:
         result = preflight(config, root / "preflight.json")
         print(f"Preflight {'PASS' if result['passed'] else 'MISS'}: {root / 'preflight.json'}")
@@ -51,7 +36,7 @@ def main():
     selected_device = device(args.device or config["device"])
     path = root / "cfm" / f"{args.checkpoint}.pt"
     model, checkpoint = load_model(path, config, selected_device)
-    cache = prepare(config, root / "pairs.pt")
+    cache = prepare(config, pair_cache_path(config))
     if cache["spec"] != checkpoint["cache_spec"]:
         raise ValueError("Checkpoint and CFM pair cache differ")
     suffix = "_guarded" if config["evaluation"].get("guarded", False) else ""

@@ -221,8 +221,12 @@ def evaluate_motion(models, config, device, output, metadata=None):
     physics = PhysicsConfig(**config["physics"])
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    model_formats = {name: getattr(model, "checkpoint_format", CHECKPOINT_FORMAT)
+                     for name, model in models.items()}
+    formats = set(model_formats.values())
     report = dict(scope="Per-frame frozen contact diagnostic; fresh lambda=0; no finish/restitution/friction/CCD",
-        model_format=CHECKPOINT_FORMAT, solver=SOLVER_DESCRIPTION,
+        model_format=next(iter(formats)) if len(formats) == 1 else ("mixed" if formats else None),
+        model_formats=model_formats, solver=SOLVER_DESCRIPTION,
         raw_definition="Analytic projection in the endpoint head; no EXTRA guard/finish",
         local_definition="No neural coupling; identical endpoint formula and tau schedule",
         timing_scope="Simulation includes free dynamics, geometry/D/eta setup, solve, FD; excludes oracle/metrics/rendering. Not a speed benchmark.",

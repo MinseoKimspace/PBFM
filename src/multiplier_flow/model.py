@@ -7,7 +7,8 @@ from torch import nn
 from .problem import contact_endpoint, gap, matvec, position_error
 
 
-CHECKPOINT_FORMAT = "multiplier_contact_cfm_v2"
+CHECKPOINT_FORMAT = "multiplier_contact_cfm_v3"
+LEGACY_CHECKPOINT_FORMAT = "multiplier_contact_cfm_v2"
 
 SOLVER_DESCRIPTION = (
     "Contact-structured CFM: learned cross-contact rates, analytic projected "
@@ -17,18 +18,66 @@ SOLVER_DESCRIPTION = (
 
 def load_model(path, config, device):
     checkpoint = torch.load(path, map_location=device, weights_only=True)
-    if checkpoint.get("format") != CHECKPOINT_FORMAT or checkpoint.get("objective") != "cfm":
-        raise ValueError("Expected contact-structured CFM v2; raw CFM v1 and old B/C weights cannot be reused")
+    if (checkpoint.get("format") not in (CHECKPOINT_FORMAT, LEGACY_CHECKPOINT_FORMAT)
+            or checkpoint.get("objective") != "cfm"):
+        raise ValueError("Expected contact-structured CFM v2/v3; raw CFM v1 and old B/C weights cannot be reused")
     for section in ("model", "physics", "dynamics", "reference", "data", "seed"):
         if checkpoint["config"][section] != config[section]:
             raise ValueError(f"Checkpoint {section} differs; use its training configuration")
+    if checkpoint["format"] == LEGACY_CHECKPOINT_FORMAT:
+        settings = config["model"]
+        if (settings.get("communication", "local") != "local"
+                or settings.get("feature_version", "legacy") != "legacy"):
+            raise ValueError("CFM v2 weights require local communication and legacy features")
     model = ConditionalField(**config["model"]).to(device)
-    model.load_state_dict(checkpoint["model"])
+    try:
+        model.load_state_dict(checkpoint["model"], strict=True)
+    except RuntimeError as error:
+        raise ValueError("Checkpoint weights do not match their declared model configuration") from error
+    model.checkpoint_format = checkpoint["format"]
     return model.eval(), checkpoint
 
 
 def mlp(inputs, hidden, outputs):
     return nn.Sequential(nn.Linear(inputs, hidden), nn.SiLU(), nn.Linear(hidden, outputs))
+
+
+class ComponentAttention(nn.Module):
+    """Full attention within each dynamic contact component, without pooling.
+
+    A signed, mass-normalized D entry biases each head's attention score. Zero
+    D entries are still visible when reach says the contacts share a component.
+    LayerNorm acts only on one token's channels, so disconnected problems and
+    padding cannot change another component's feature normalization.
+    """
+
+    def __init__(self, hidden_dim, heads):
+        super().__init__()
+        self.heads = heads
+        self.head_dim = hidden_dim // heads
+        self.attention_norm = nn.LayerNorm(hidden_dim)
+        self.qkv = nn.Linear(hidden_dim, 3 * hidden_dim)
+        self.relation_weight = nn.Parameter(torch.ones(heads))
+        self.output = nn.Linear(hidden_dim, hidden_dim)
+        self.update_norm = nn.LayerNorm(hidden_dim)
+        self.update = mlp(hidden_dim, 2 * hidden_dim, hidden_dim)
+
+    def forward(self, embedding, relation, reach, mask):
+        batch, contacts, hidden = embedding.shape
+        qkv = self.qkv(self.attention_norm(embedding))
+        qkv = qkv.reshape(batch, contacts, 3, self.heads, self.head_dim)
+        query, key, value = qkv.permute(2, 0, 3, 1, 4).unbind(0)
+        scores = (query @ key.transpose(-1, -2)) / self.head_dim ** 0.5
+        scores = scores + self.relation_weight[None, :, None, None] * relation[:, None]
+        allowed = reach & mask[:, :, None] & mask[:, None, :]
+        # A padded query has no keys. A finite sentinel plus explicit masking
+        # produces zero attention (and finite gradients) for those empty rows.
+        scores = scores.masked_fill(~allowed[:, None], torch.finfo(scores.dtype).min)
+        weights = torch.softmax(scores, dim=-1) * allowed[:, None]
+        weights = weights / weights.sum(-1, keepdim=True).clamp_min(1e-12)
+        mixed = (weights @ value).transpose(1, 2).reshape(batch, contacts, hidden)
+        embedding = (embedding + self.output(mixed)) * mask[..., None]
+        return (embedding + self.update(self.update_norm(embedding))) * mask[..., None]
 
 
 class LocalProjection:
@@ -55,14 +104,29 @@ class ConditionalField(nn.Module):
 
     neural_evaluations = 1
 
-    def __init__(self, hidden_dim=64, message_steps=3, length_scale=0.1):
+    def __init__(self, hidden_dim=64, message_steps=3, length_scale=0.1,
+                 communication="local", attention_heads=4, attention_layers=2,
+                 feature_version="legacy"):
         super().__init__()
         if hidden_dim < 1 or message_steps < 1 or length_scale <= 0:
             raise ValueError("Positive model dimensions/scale required")
+        if communication not in ("local", "global"):
+            raise ValueError("communication must be 'local' or 'global'")
+        if feature_version not in ("legacy", "residual"):
+            raise ValueError("feature_version must be 'legacy' or 'residual'")
+        if communication == "global" and (attention_heads < 1 or attention_layers < 1
+                                           or hidden_dim % attention_heads != 0):
+            raise ValueError("Global attention requires positive heads/layers and hidden_dim divisible by heads")
         self.length_scale = length_scale
-        self.encoder = mlp(5, hidden_dim, hidden_dim)
+        self.communication = communication
+        self.feature_version = feature_version
+        # Legacy defaults keep the original v2 parameter names and dimensions.
+        self.encoder = mlp(5 if feature_version == "legacy" else 6, hidden_dim, hidden_dim)
         self.updates = nn.ModuleList(mlp(2 * hidden_dim, hidden_dim, hidden_dim)
                                      for _ in range(message_steps))
+        self.attention = nn.ModuleList(
+            ComponentAttention(hidden_dim, attention_heads) for _ in range(
+                attention_layers if communication == "global" else 0))
         self.head = nn.Linear(hidden_dim, 1)
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
@@ -72,14 +136,23 @@ class ConditionalField(nn.Module):
         mask = problem["mask"]
         diagonal = problem["D"].diagonal(dim1=1, dim2=2).clamp_min(1e-12)
         scale = self.length_scale / diagonal
-        features = torch.stack((lam / scale, problem["c"] / self.length_scale,
-                                gap(problem, lam) / self.length_scale,
-                                torch.log1p(diagonal), tau), -1)
+        features = [lam / scale, problem["c"] / self.length_scale,
+                    gap(problem, lam) / self.length_scale,
+                    torch.log1p(diagonal), tau]
+        if self.feature_version == "residual":
+            # Coordinate projected residual avoids the scene-wide spectral eta:
+            # adding an independent stiff component cannot change this feature.
+            # Only fixed diagonal scaling is used: a component RMS would leak
+            # a global dynamic summary into the local communication ablation.
+            features.append((lam - contact_endpoint(problem, lam)) / scale)
+        features = torch.stack(features, -1)
         embedding = self.encoder(features) * mask[..., None]
-        coupling = problem["D"] / (diagonal[:, :, None] * diagonal[:, None, :]).sqrt()
-        coupling = coupling / coupling.abs().sum(-1, keepdim=True).clamp_min(1)
+        relation = problem["D"] / (diagonal[:, :, None] * diagonal[:, None, :]).sqrt()
+        coupling = relation / relation.abs().sum(-1, keepdim=True).clamp_min(1)
         for update in self.updates:
             embedding = (embedding + update(torch.cat((embedding, coupling @ embedding), -1))) * mask[..., None]
+        for attention in self.attention:
+            embedding = attention(embedding, relation, problem["reach"], mask)
         rate = scale * self.head(embedding).squeeze(-1)
         # Do not invent coupling for a disconnected, initially feasible component.
         activity = lam.abs() + problem["c"].clamp_max(0).abs()
