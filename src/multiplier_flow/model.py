@@ -1,4 +1,4 @@
-"""CFM with analytic contact projection and learned cross-contact correction."""
+"""Shared contact CFM backbone with analytic or direct velocity outputs."""
 from __future__ import annotations
 
 import torch
@@ -7,22 +7,36 @@ from torch import nn
 from .problem import contact_endpoint, gap, matvec, position_error
 
 
-CHECKPOINT_FORMAT = "multiplier_contact_cfm_v3"
+CHECKPOINT_FORMAT = "multiplier_contact_cfm_v4"
 LEGACY_CHECKPOINT_FORMAT = "multiplier_contact_cfm_v2"
+ANALYTIC_CHECKPOINT_FORMAT = "multiplier_contact_cfm_v3"
 
 SOLVER_DESCRIPTION = (
     "Contact-structured CFM: learned cross-contact rates, analytic projected "
     "coordinate endpoint, convex-combination Euler; not sequential PGS"
 )
+DIRECT_SOLVER_DESCRIPTION = (
+    "Direct-velocity contact CFM: signed learned field, projected Euler updates; "
+    "raw-field velocity matching, no analytic output endpoint or PGS finish"
+)
 
 
 def load_model(path, config, device):
     checkpoint = torch.load(path, map_location=device, weights_only=True)
-    if (checkpoint.get("format") not in (CHECKPOINT_FORMAT, LEGACY_CHECKPOINT_FORMAT)
+    if (checkpoint.get("format") not in (
+            CHECKPOINT_FORMAT, ANALYTIC_CHECKPOINT_FORMAT, LEGACY_CHECKPOINT_FORMAT)
             or checkpoint.get("objective") != "cfm"):
-        raise ValueError("Expected contact-structured CFM v2/v3; raw CFM v1 and old B/C weights cannot be reused")
+        raise ValueError("Expected contact CFM v2/v3/v4; raw CFM v1 and old B/C weights cannot be reused")
     for section in ("model", "physics", "dynamics", "reference", "data", "seed"):
-        if checkpoint["config"][section] != config[section]:
+        saved, requested = checkpoint["config"][section], config[section]
+        if section == "model":
+            # v2/v3 predate the head selector and always mean analytic. Preserve
+            # their parameter names and accept an explicit analytic default.
+            saved = {"head_type": "analytic", **saved}
+            requested = {"head_type": "analytic", **requested}
+            if checkpoint["format"] != CHECKPOINT_FORMAT and saved["head_type"] != "analytic":
+                raise ValueError("Legacy v2/v3 checkpoints require an analytic head")
+        if saved != requested:
             raise ValueError(f"Checkpoint {section} differs; use its training configuration")
     if checkpoint["format"] == LEGACY_CHECKPOINT_FORMAT:
         settings = config["model"]
@@ -88,17 +102,19 @@ class LocalProjection:
     """
 
     neural_evaluations = 0
+    head_type = "analytic"
 
     def endpoint(self, lam, tau, problem):
         return contact_endpoint(problem, lam)
 
 
 class ConditionalField(nn.Module):
-    """Predict coupling; solve each scalar contact analytically inside the field.
+    """Identical features/backbone; only the final velocity parameterization varies.
 
-    q = lambda + (1-tau)*r_theta estimates other contacts' endpoint multipliers.
-    end = contact_endpoint(q); u_theta = (end-lambda)/(1-tau).
-    Signed rates permit release, while end is nonnegative by construction.
+    Analytic: q=lambda+(1-tau)*r; u=(contact_endpoint(q)-lambda)/(1-tau).
+    Direct: u=r, with no clipping or endpoint transform inside the field.
+    Both rates are signed. Direct states are projected by the integrator, so
+    CFM still trains the raw velocity, including negative release directions.
     The fixed original problem is the condition; no solution is an input.
     """
 
@@ -106,7 +122,7 @@ class ConditionalField(nn.Module):
 
     def __init__(self, hidden_dim=64, message_steps=3, length_scale=0.1,
                  communication="local", attention_heads=4, attention_layers=2,
-                 feature_version="legacy"):
+                 feature_version="legacy", head_type="analytic"):
         super().__init__()
         if hidden_dim < 1 or message_steps < 1 or length_scale <= 0:
             raise ValueError("Positive model dimensions/scale required")
@@ -114,12 +130,15 @@ class ConditionalField(nn.Module):
             raise ValueError("communication must be 'local' or 'global'")
         if feature_version not in ("legacy", "residual"):
             raise ValueError("feature_version must be 'legacy' or 'residual'")
+        if head_type not in ("analytic", "direct"):
+            raise ValueError("head_type must be 'analytic' or 'direct'")
         if communication == "global" and (attention_heads < 1 or attention_layers < 1
                                            or hidden_dim % attention_heads != 0):
             raise ValueError("Global attention requires positive heads/layers and hidden_dim divisible by heads")
         self.length_scale = length_scale
         self.communication = communication
         self.feature_version = feature_version
+        self.head_type = head_type
         # Legacy defaults keep the original v2 parameter names and dimensions.
         self.encoder = mlp(5 if feature_version == "legacy" else 6, hidden_dim, hidden_dim)
         self.updates = nn.ModuleList(mlp(2 * hidden_dim, hidden_dim, hidden_dim)
@@ -131,7 +150,18 @@ class ConditionalField(nn.Module):
         nn.init.zeros_(self.head.weight)
         nn.init.zeros_(self.head.bias)
 
+    @property
+    def solver_description(self):
+        return DIRECT_SOLVER_DESCRIPTION if self.head_type == "direct" else SOLVER_DESCRIPTION
+
     def coupling_rate(self, lam, tau, problem):
+        """Shared signed network output, in multiplier units per FM time.
+
+        The legacy method name is retained for analytic checkpoints and exact-
+        rate diagnostics. With a direct head this IS the final FM velocity.
+        Analytic contact endpoints may still appear in input residual features;
+        neither head changes those features or their normalization.
+        """
         tau = tau.reshape(-1, 1).expand_as(lam)
         mask = problem["mask"]
         diagonal = problem["D"].diagonal(dim1=1, dim2=2).clamp_min(1e-12)
@@ -160,6 +190,8 @@ class ConditionalField(nn.Module):
         return rate * (mask & live)
 
     def endpoint(self, lam, tau, problem):
+        if self.head_type != "analytic":
+            raise ValueError("Direct velocity heads have no analytic endpoint; use the field integrator")
         # Predict a RATE so the learned remaining correction vanishes as tau->1.
         # This keeps the straight-path training target representable: if
         # r_theta=target-source and target is KKT, this returns target exactly.
@@ -171,7 +203,17 @@ class ConditionalField(nn.Module):
         remaining = 1 - tau.reshape(-1, 1)
         if (remaining <= 0).any() or (remaining > 1).any():
             raise ValueError("CFM field requires 0 <= tau < 1; never evaluate at tau=1")
-        return (self.endpoint(lam, tau, problem) - lam) / remaining
+        return self.velocity(lam, tau, problem)
+
+    def velocity(self, lam, tau, problem):
+        """Field implementation shared by CFM and the solver-owned valid clock.
+
+        Public forward validates external times. Integrators already construct
+        times in [0,1), so they avoid a GPU synchronization for that same check.
+        """
+        if self.head_type == "direct":
+            return self.coupling_rate(lam, tau, problem)
+        return (self.endpoint(lam, tau, problem) - lam) / (1 - tau.reshape(-1, 1))
 
 
 def cfm_loss(model, problem, source, target, tau):
@@ -179,8 +221,9 @@ def cfm_loss(model, problem, source, target, tau):
 
     lambda_tau=(1-tau)*source+tau*target, u_target=target-source.
     target is a converged QP label, never a finite-time reference ODE label.
-    The matched field INCLUDES the analytic projection; do not match the raw
-    neural coupling head. Endpoint MSE is diagnostic, not an extra objective.
+    Match the final field returned by forward: analytic endpoint-derived
+    velocity or raw direct velocity. The direct integrator's state projection
+    is deliberately absent here. Endpoint MSE is diagnostic, not an objective.
     """
     tau = tau.reshape(-1, 1)
     state = torch.lerp(source, target, tau)

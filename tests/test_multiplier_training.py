@@ -107,8 +107,11 @@ class RolloutTrainingTests(unittest.TestCase):
         self.assertEqual(len({str(pair_cache_path(c)) for c in resolved}), 1)
         self.assertEqual(len({c["outdir"] for c in resolved}), len(VARIANTS))
         self.assertTrue(all(c["data"] == config["data"] for c in resolved))
-        self.assertEqual([c["model"]["communication"] for c in resolved], ["local", "global", "local", "global", "global"])
-        self.assertEqual([c["train"]["inner_rollout"]["weight"] for c in resolved], [0, 0, 1, 1, 1])
+        self.assertEqual([c["model"]["communication"] for c in resolved],
+                         ["local", "global", "local", "global", "global", "global", "global"])
+        self.assertEqual([c["model"]["head_type"] for c in resolved],
+                         ["analytic"] * 5 + ["direct", "direct"])
+        self.assertEqual([c["train"]["inner_rollout"]["weight"] for c in resolved], [0, 0, 1, 1, 1, 0, 1])
         disabled = copy.deepcopy(config)
         disabled["train"]["inner_rollout"] = dict(weight=0)
         with self.assertRaises(ValueError):
@@ -132,6 +135,7 @@ class RolloutTrainingTests(unittest.TestCase):
                 self.assertEqual(result["updates"], 2)
                 model, checkpoint = load_model(result["checkpoint"], selected, "cpu")
                 self.assertEqual(model.communication, selected["model"]["communication"])
+                self.assertEqual(model.head_type, selected["model"]["head_type"])
                 self.assertEqual(set(checkpoint["solver_validation"]["by_calls"]), {"1", "2"})
                 history = json.loads((Path(selected["outdir"])/"cfm"/"history.json").read_text())
                 self.assertGreaterEqual(history[-1]["train_total"], history[-1]["train_cfm"])

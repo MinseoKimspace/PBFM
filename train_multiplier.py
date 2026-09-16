@@ -1,4 +1,4 @@
-"""Train contact-structured CFM; analytic projection is inside the learned field."""
+"""Train contact CFM with an analytic endpoint or a direct velocity head."""
 from __future__ import annotations
 
 import argparse
@@ -12,7 +12,7 @@ from src.contact_flow.io import device, load_config
 from src.multiplier_flow.data import batch, cache_summary, prepare
 from src.multiplier_flow.evaluation import solver_validation, timed, write_json
 from src.multiplier_flow.experiment import VARIANTS, pair_cache_path, resolve_experiment
-from src.multiplier_flow.model import CHECKPOINT_FORMAT, SOLVER_DESCRIPTION, ConditionalField, cfm_loss
+from src.multiplier_flow.model import CHECKPOINT_FORMAT, ConditionalField, cfm_loss
 from src.multiplier_flow.training import training_objective, validate_objectives
 
 
@@ -98,7 +98,8 @@ def train(config, selected_device, *, prepare_only=False, profile_only=False,
     example = batch(training, torch.arange(min(settings["batch_size"], len(training["context"]))), selected_device)
     profiling = profile(model, example, selected_device, settings)
     write_json(root / "profile_cfm.json", dict(device=str(selected_device), costs=profiling,
-                                             solver=SOLVER_DESCRIPTION, format=CHECKPOINT_FORMAT))
+                                             solver=model.solver_description, head_type=model.head_type,
+                                             format=CHECKPOINT_FORMAT))
     if profile_only:
         return profiling
     run.mkdir(parents=True, exist_ok=True)
@@ -119,7 +120,7 @@ def train(config, selected_device, *, prepare_only=False, profile_only=False,
         tau_rng = torch.Generator().manual_seed(config["seed"] + 100000 + epoch)
         rollout_rng = torch.Generator().manual_seed(config["seed"] + 300000 + epoch)
         totals, seen = {}, 0
-        endpoint_evaluations = 0
+        field_evaluations = 0
         budget_counts = {}
         epoch_began = perf_counter()
         for indices in torch.randperm(count, generator=order_rng).split(settings["batch_size"]):
@@ -136,7 +137,7 @@ def train(config, selected_device, *, prepare_only=False, profile_only=False,
             seen += len(indices)
             for name, term in terms.items():
                 totals[name] = totals.get(name, 0.0) + float(term) * len(indices)
-            endpoint_evaluations += len(indices) * (1 + costs["inner_calls"] + costs["recovery_calls"])
+            field_evaluations += len(indices) * (1 + costs["inner_calls"] + costs["recovery_calls"])
             key = str(costs["inner_calls"])
             budget_counts[key] = budget_counts.get(key, 0) + 1
             if updates >= budget:
@@ -151,7 +152,9 @@ def train(config, selected_device, *, prepare_only=False, profile_only=False,
                    **{f"train_{name}": value/seen for name, value in totals.items()}, val_cfm=val["cfm"],
                    val_endpoint_estimate_mse=val["endpoint_estimate_mse"],
                    elapsed_seconds=perf_counter()-began, training_seconds=training_seconds,
-                   training_endpoint_evaluations=endpoint_evaluations, inner_budget_updates=budget_counts)
+                   training_field_evaluations=field_evaluations,
+                   # Retain the old counter key for existing analysis scripts.
+                   training_endpoint_evaluations=field_evaluations, inner_budget_updates=budget_counts)
         diagnostic = (updates-last_diagnostic >= settings["solver_validation_every"]
                       or updates == budget or epoch == 0)
         if diagnostic:
@@ -159,7 +162,8 @@ def train(config, selected_device, *, prepare_only=False, profile_only=False,
             last_diagnostic = updates
         history.append(row)
         checkpoint = dict(format=CHECKPOINT_FORMAT, objective="cfm", epoch=epoch+1, updates=updates,
-                          solver=SOLVER_DESCRIPTION, config=config, cache_spec=cache["spec"], model=model.state_dict(),
+                          solver=model.solver_description, head_type=model.head_type,
+                          config=config, cache_spec=cache["spec"], model=model.state_dict(),
                           optimizer=optimizer.state_dict(), val_cfm=val["cfm"],
                           selection_metric="fixed-sample validation CFM loss")
         torch.save(checkpoint, run / "last.pt")
@@ -188,7 +192,7 @@ def main():
     parser.add_argument("--config", default="configs/multiplier_cfm.yaml")
     parser.add_argument("--device")
     parser.add_argument("--outdir")
-    parser.add_argument("--variant", choices=VARIANTS, help="Controlled communication/rollout ablation")
+    parser.add_argument("--variant", choices=VARIANTS, help="Controlled communication/head/rollout ablation")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--max-updates", type=int)
     modes = parser.add_mutually_exclusive_group()

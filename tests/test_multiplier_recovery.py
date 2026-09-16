@@ -171,6 +171,31 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(summary["perturbed"]["success_count"], 0)
         self.assertEqual(summary["null_gain_count"], 1)
 
+    def test_common_middle_states_do_not_depend_on_the_learned_model(self):
+        class DifferentEndpoint:
+            neural_evaluations = 1
+
+            def endpoint(self, state, tau, problem):
+                return torch.full_like(state, .7)
+
+        problem, optimum = chain_problem()
+        split = dict(problem=problem, optimum=optimum, names=["chain_0"])
+        config = dict(seed=9, model=dict(length_scale=.1), reference=dict(max_sweeps=100),
+            evaluation=dict(tolerance=1e-5, recovery=dict(max_scenes=1, calls=[4],
+                kinds=["independent"], amplitudes=[.1], start_fractions=[.5])))
+        local = recovery_evaluation(LocalProjection(), split, config, "cpu")
+        changed = recovery_evaluation(DifferentEndpoint(), split, config, "cpu")
+        for left, right in zip(local["common_start"]["rows"], changed["common_start"]["rows"]):
+            self.assertEqual(left["common_start_multiplier"], right["common_start_multiplier"])
+            self.assertEqual(left["perturbed_start_multiplier"], right["perturbed_start_multiplier"])
+            self.assertEqual(left["start_time"], .5)
+            self.assertEqual(left["remaining_calls"], 2)
+        learned = next(row for row in changed["common_start"]["rows"] if row["method"] == "cfm")
+        baseline = next(row for row in changed["common_start"]["rows"] if row["method"] == "local")
+        self.assertNotEqual(learned["clean"]["projection_position_mse"],
+                            baseline["clean"]["projection_position_mse"])
+        json.dumps(changed, allow_nan=False)
+
 
 if __name__ == "__main__":
     unittest.main()

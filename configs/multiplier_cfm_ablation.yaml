@@ -1,4 +1,5 @@
-# Shared A/B/C/D training configuration for RTX A6000. Select with --variant.
+# Shared analytic/direct-head ablations for RTX A6000. Select with --variant.
+# Direct-head comparison: B, B_direct, D, D_direct. All use identical pairs.
 seed: 42
 device: auto
 cpu_threads: 1
@@ -33,6 +34,7 @@ data:
   sources_per_scene: 24       # Four samples per each of the six source modes.
   reference_batch_size: 256  # CPU float64 labels; independent of GPU batch size.
 model:
+  head_type: analytic        # B_direct/D_direct select signed direct velocity.
   hidden_dim: 64
   message_steps: 3
   length_scale: 0.1
@@ -52,7 +54,7 @@ train:
   solver_validation_every: 1000  # Checked at epoch boundaries (396 updates/epoch).
   validation_calls: [1, 2, 4]
   inner_rollout:
-    weight: 1.0             # A/B disable this; C/D enable it.
+    weight: 1.0             # A/B/B_direct disable; C/D/D_direct enable.
     calls: [1, 2, 4]         # Sample one budget uniformly per update.
     residual_weight: 1.0
     position_weight: 1.0

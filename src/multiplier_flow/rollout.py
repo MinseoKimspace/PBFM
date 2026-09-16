@@ -3,8 +3,9 @@
 Rebuild contacts each physical frame, start lambda=0, update velocity by FD.
 No relinearization inside a frame, restitution, friction, CCD resolution,
 warm-start transfer, position/velocity clipping, or hidden finishing solver.
-CFM DOES contain analytic multiplier projection in its endpoint head. Geometric/swept
-checks only measure errors; they NEVER correct the trajectory.
+Analytic CFM projects inside its endpoint head; direct CFM projects multiplier
+states after Euler updates. Geometric/swept checks only measure errors; they
+NEVER correct the trajectory.
 """
 from __future__ import annotations
 
@@ -15,7 +16,8 @@ import torch
 
 from src.contact_flow.dynamics import free_position, finite_difference_state
 from src.contact_flow.physics import PhysicsConfig, geometry, valid_positions
-from .evaluation import timed, write_json
+from .evaluation import (aggregate_projection_rows, collect_projection_diagnostics,
+                         projection_summary, timed, unclipped_summary, write_json)
 from .model import CHECKPOINT_FORMAT, SOLVER_DESCRIPTION, LocalProjection
 from .problem import converged, decode, gap, make_problem, pack, position_error, residuals
 from .solvers import pgs, run_cfm
@@ -85,10 +87,14 @@ def simulate(initial, radius, config, device, model=None, calls=1, guarded=False
             if model is None:
                 return pgs(problem, start, tolerance, ref["max_sweeps"])
             return run_cfm(model, problem, start, calls,
-                           guarded, settings.get("max_backtracks", 8))
+                           guarded, settings.get("max_backtracks", 8), collect_diagnostics=False)
         result, solver_seconds = timed(device, solve)
+        if getattr(model, "head_type", "analytic") == "direct":
+            collect_projection_diagnostics(model, problem, start, calls, result,
+                                           guarded, settings.get("max_backtracks", 8))
         counters = {key: int(result[key].sum()) for key in
-                    ("nfe", "neural_evals", "backtracks", "interventions", "sweeps", "contact_evals") if key in result}
+                    ("nfe", "neural_evals", "backtracks", "interventions", "sweeps", "contact_evals", "accepted_steps") if key in result}
+        counters.update(projection_summary(result))
         if "completed" in result and not bool(result["completed"].all()):
             failure = dict(frame=frame+1, reason="incomplete_solver_clock", counters=counters,
                            solver_tau=float(result["time"][0]), failure_code=int(result["failure_code"][0]),
@@ -143,6 +149,11 @@ def simulate(initial, radius, config, device, model=None, calls=1, guarded=False
             dynamics_seconds=dynamics_seconds+update_seconds, setup_seconds=setup_seconds,
             solver_seconds=solver_seconds,
             simulation_seconds=dynamics_seconds+setup_seconds+solver_seconds+update_seconds, **counters)
+        if getattr(model, "head_type", "analytic") == "direct" and not guarded:
+            diagnostic = unclipped_summary(model, problem, start, calls, tolerance)
+            diagnostic.pop("per_scene")  # This frame contains exactly one QP.
+            diagnostic["scope"] = "Untimed same-frame frozen-QP counterfactual; not an unprojected physical rollout"
+            row["unclipped_diagnostic"] = diagnostic
         rows.append(row)
         state, previous = next_state, contacts
         states.append(state.cpu().clone())
@@ -156,14 +167,27 @@ def simulate(initial, radius, config, device, model=None, calls=1, guarded=False
 def rollout_summary(rows):
     def summarize(items):
         count = len(items)
-        return dict(frames=count, unconverged_steps=sum(not x["solver_converged"] for x in items),
+        report = dict(frames=count, unconverged_steps=sum(not x["solver_converged"] for x in items),
             max_geometric_penetration=max((x["geometric_penetration"] for x in items), default=0.),
             new_violations=sum(x["new_violations_outside_frozen_contacts"] for x in items),
             swept_endpoint_missed_pairs=sum(x["swept_endpoint_missed_pairs"] for x in items),
             contacts_added=sum(x["contacts_added"] for x in items),
             contacts_released=sum(x["contacts_released"] for x in items),
             mean_simulation_seconds=sum(x["simulation_seconds"] for x in items)/max(count, 1),
-            max_speed=max((x["max_speed"] for x in items), default=0.))
+            max_speed=max((x["max_speed"] for x in items), default=0.),
+            **aggregate_projection_rows(items))
+        unclipped = [x["unclipped_diagnostic"] for x in items if "unclipped_diagnostic" in x]
+        if unclipped:
+            report["unclipped_diagnostic"] = dict(
+                scope="Same-frame frozen-QP counterfactuals on the projected physical trajectory; excluded from timing",
+                frames=len(unclipped),
+                completed_count=sum(x["completed_count"] for x in unclipped),
+                success_count=sum(x["success_count"] for x in unclipped),
+                max_penetration=max(x["max_penetration"] for x in unclipped),
+                max_projected_gradient=max(x["max_projected_gradient"] for x in unclipped),
+                max_negative_multiplier=max(x["max_negative_multiplier"] for x in unclipped),
+                min_unprojected_multiplier=min(x["min_unprojected_multiplier"] for x in unclipped))
+        return report
     report = summarize(rows)
     report["phases"] = {phase: summarize([x for x in rows if x["phase"] == phase])
                         for phase in ("free_flight", "onset", "contact", "release")}
@@ -223,13 +247,20 @@ def evaluate_motion(models, config, device, output, metadata=None):
     output.parent.mkdir(parents=True, exist_ok=True)
     model_formats = {name: getattr(model, "checkpoint_format", CHECKPOINT_FORMAT)
                      for name, model in models.items()}
+    descriptions = {name: getattr(model, "solver_description", SOLVER_DESCRIPTION)
+                    for name, model in models.items()}
+    head_types = {name: getattr(model, "head_type", "analytic") for name, model in models.items()}
     formats = set(model_formats.values())
+    solvers = set(descriptions.values())
     report = dict(scope="Per-frame frozen contact diagnostic; fresh lambda=0; no finish/restitution/friction/CCD",
         model_format=next(iter(formats)) if len(formats) == 1 else ("mixed" if formats else None),
-        model_formats=model_formats, solver=SOLVER_DESCRIPTION,
-        raw_definition="Analytic projection in the endpoint head; no EXTRA guard/finish",
-        local_definition="No neural coupling; identical endpoint formula and tau schedule",
-        timing_scope="Simulation includes free dynamics, geometry/D/eta setup, solve, FD; excludes oracle/metrics/rendering. Not a speed benchmark.",
+        model_formats=model_formats, head_types=head_types,
+        solver=next(iter(solvers)) if len(solvers) == 1 else ("mixed" if solvers else None),
+        solver_descriptions=descriptions,
+        raw_definition="Analytic heads project their endpoint; direct heads project multipliers after Euler updates; no Q guard or finish",
+        local_definition="Analytic local endpoint with zero neural coupling and the same tau schedule",
+        timing_scope="Simulation includes free dynamics, geometry/D/eta setup, solve with neural features/projection, FD; excludes oracle/metrics/projection-counter reductions/unclipped counterfactual/rendering. Not a speed benchmark.",
+        unclipped_scope="Raw direct methods only: same-frame frozen-QP counterfactuals; not separate physical trajectories or primary performance results",
         swept_scope="Straight previous-to-next position segments only, NOT internal solver trajectories",
         device=str(device), config=config, metadata=metadata or {}, scenes={})
     for name, initial, radius in motion_scenes(physics):

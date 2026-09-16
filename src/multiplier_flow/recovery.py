@@ -217,6 +217,47 @@ def _cooperative_case(model, calls_list, tolerance, device):
                 exact_coupling_head_gap=gap(problem, exact_endpoint)[0].tolist(), rows=rows)
 
 
+def _common_start_trials(model, split, indices, settings, calls_list, tolerance,
+                         length_scale, seed, denominator_epsilon, device):
+    """Compare suffixes from checkpoint-independent, identical middle states.
+
+    A fixed local analytic prefix supplies the state; its QP reference endpoint
+    is used only for metrics. Perturb once, then pass the exact same tensors to
+    every method. This complements recovery along each model's own trajectory.
+    """
+    rows = []
+    for index in indices:
+        problem = move(select(split["problem"], slice(index, index + 1)), device, torch.float32)
+        optimum = split["optimum"][index:index + 1].to(device=device, dtype=torch.float32)
+        for calls in calls_list:
+            for start_step in _start_steps(settings, calls):
+                start = integrate_cfm(LocalProjection(), problem, torch.zeros_like(optimum),
+                                      calls, end_step=start_step)
+                for kind_index, kind in enumerate(settings.get("kinds", ["independent", "correlated"])):
+                    for amplitude_index, amplitude in enumerate(settings.get("amplitudes", [0.1])):
+                        trial_seed = seed + index * 1000003 + calls * 10007 + start_step * 503
+                        trial_seed += kind_index * 37 + amplitude_index
+                        perturbed, _ = perturb_state(problem, start, kind=kind,
+                            amplitude=float(amplitude), length_scale=length_scale,
+                            generator=torch.Generator(device="cpu").manual_seed(trial_seed))
+                        for method, solver in (("cfm", model), ("local", LocalProjection())):
+                            clean_final, clean = _flow_trial(solver, problem, start, optimum,
+                                                            tolerance, calls, start_step, device)
+                            final, disturbed = _flow_trial(solver, problem, perturbed, optimum,
+                                                            tolerance, calls, start_step, device)
+                            rows.append(dict(name=split["names"][index], method=method,
+                                calls=calls, start_step=start_step, start_time=start_step / calls,
+                                remaining_calls=calls - start_step, kind=kind, amplitude=float(amplitude),
+                                common_start_multiplier=start[0].tolist(),
+                                perturbed_start_multiplier=perturbed[0].tolist(),
+                                **recovery_gain(problem, start, perturbed, clean_final, final,
+                                                denominator_epsilon),
+                                clean=clean, perturbed=disturbed))
+    return dict(scope="Identical local-prefix state and perturbation for every model; fixed QP and FM clock",
+                start_source="Untrained LocalProjection prefix; reference solution used only for metrics",
+                summary=_summaries(rows), rows=rows)
+
+
 @torch.no_grad()
 def recovery_evaluation(model, split, config, device):
     """Bounded, stratified clean/perturbed suffix comparison on a fixed QP.
@@ -255,6 +296,8 @@ def recovery_evaluation(model, split, config, device):
         model.eval()
     try:
         cooperative = _cooperative_case(model, calls_list, tolerance, device)
+        common_start = _common_start_trials(model, split, indices, settings, calls_list,
+            tolerance, length_scale, seed, denominator_epsilon, device)
         for index in indices:
             problem = move(select(split["problem"], slice(index, index + 1)), device, torch.float32)
             optimum = split["optimum"][index:index + 1].to(device=device, dtype=torch.float32)
@@ -303,4 +346,4 @@ def recovery_evaluation(model, split, config, device):
                 amplitude_note="Requested physical RMS; clipping and bounded multiplier noise can reduce it",
                 timing_note="One suffix/PGS solve per row; excludes setup, perturbation generation and metrics",
                 denominator_epsilon=denominator_epsilon, summary=_summaries(rows),
-                cooperative_case=cooperative, rows=rows)
+                cooperative_case=cooperative, common_start=common_start, rows=rows)

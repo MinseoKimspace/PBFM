@@ -20,16 +20,38 @@ def advance_endpoint(state, endpoint, time, step_size):
     return (1 - fraction) * state + fraction * endpoint
 
 
-def cfm_step(model, problem, state, time, next_time):
+def _solver_output(model, problem, state, time):
+    """Evaluate once: direct raw velocity or the analytic endpoint shortcut.
+
+    The shortcut evaluates exactly the field used by CFM, but lets analytic
+    Euler avoid the division by 1-time. It must never wrap a direct field.
+    """
+    if getattr(model, "head_type", "analytic") == "direct":
+        return getattr(model, "velocity", model)(state, time, problem)
+    return model.endpoint(state, time, problem)
+
+
+def _advance_output(model, problem, state, output, time, step_size, project_state):
+    """Return (deployed update, unprojected update) without reevaluating the net."""
+    if getattr(model, "head_type", "analytic") == "direct":
+        raw = state + step_size.reshape(-1, 1) * output
+        raw = raw.masked_fill(~problem["mask"], 0)
+        return (raw.clamp_min(0) if project_state else raw), raw
+    candidate = advance_endpoint(state, output, time, step_size)
+    return candidate, candidate
+
+
+def cfm_step(model, problem, state, time, next_time, *, project_state=True):
     """One autograd-preserving step; geometry and the original QP stay fixed."""
     time = torch.as_tensor(time, dtype=state.dtype, device=state.device).expand(len(state))
     next_time = torch.as_tensor(next_time, dtype=state.dtype, device=state.device).expand(len(state))
-    endpoint = model.endpoint(state, time, problem)
-    return advance_endpoint(state, endpoint, time, next_time - time)
+    output = _solver_output(model, problem, state, time)
+    return _advance_output(model, problem, state, output, time,
+                           next_time - time, project_state)[0]
 
 
 def integrate_cfm(model, problem, start, calls, *, start_step=0, end_step=None,
-                  return_trajectory=False):
+                  return_trajectory=False, project_state=True):
     """Integrate any contiguous part of the ORIGINAL uniform [0,1] clock.
 
     `calls` always means the full-interval budget. For example, calls=4 and
@@ -37,6 +59,8 @@ def integrate_cfm(model, problem, start, calls, *, start_step=0, end_step=None,
     No state is detached. Use torch.no_grad() outside this function for eval.
     A returned trajectory includes the supplied initial state as its first row.
     Raw inference and training have no early stop, guard, or hidden PGS finish.
+    Direct velocity heads use projected Euler, exactly as at inference. The
+    optional unprojected path is an evaluation diagnostic, not the deployed rule.
     """
     end_step = calls if end_step is None else end_step
     if (type(calls) is not int or calls < 1 or type(start_step) is not int
@@ -47,7 +71,8 @@ def integrate_cfm(model, problem, start, calls, *, start_step=0, end_step=None,
     state = start
     trajectory = [state] if return_trajectory else None
     for step in range(start_step, end_step):
-        state = cfm_step(model, problem, state, step / calls, (step + 1) / calls)
+        state = cfm_step(model, problem, state, step / calls, (step + 1) / calls,
+                         project_state=project_state)
         if trajectory is not None:
             trajectory.append(state)
     return torch.stack(trajectory) if trajectory is not None else state
@@ -107,20 +132,29 @@ def active_set_solution(problem, max_contacts=12, tolerance=1e-8):
 
 
 @torch.no_grad()
-def run_cfm(model, problem, start, calls, guarded=False, max_backtracks=12):
-    """Euler on [0,1], evaluated as a nonnegative convex combination.
+def run_cfm(model, problem, start, calls, guarded=False, max_backtracks=12, *,
+            project_state=True, collect_diagnostics=True):
+    """Fixed-budget Euler on [0,1], using the same update as training.
 
-    u=(endpoint-lambda)/(1-tau), alpha=h/(1-tau) <= 1, hence
-    lambda_next=(1-alpha)*lambda+alpha*endpoint. No division of the field near
-    tau=1 or post-integration clipping. The projection is INSIDE the model.
-    Raw means no EXTRA Q guard or PGS finish, not an unconstrained output head.
+    Analytic heads retain their stable convex-combination endpoint update.
+    Direct heads use max(0, lambda+h*u); negative velocities are never clipped.
+    Raw means no EXTRA Q guard or PGS finish. project_state=False is a separate
+    unguarded direct-head diagnostic; its negative multipliers are not hidden.
     Guarded halves h until Q does not increase; it may fail to finish.
-    NFE counts endpoint evaluations; backtracking reuses the same endpoint.
+    NFE counts field/endpoint evaluations; backtracking reuses the same output.
+    Projection metrics count actual corrections on accepted, valid entries.
+    Disable collect_diagnostics for timing, and collect them in a separate
+    untimed run; the candidate update and convergence behavior are unchanged.
     """
     if not isinstance(calls, int) or calls < 1 or max_backtracks < 0:
         raise ValueError("Positive integer calls and nonnegative backtrack limit required")
     if not torch.isfinite(start).all() or (start < 0).any():
         raise ValueError("CFM starts must be finite and nonnegative")
+    if start.shape != problem["c"].shape:
+        raise ValueError("Multiplier state must match the padded contact shape")
+    direct = getattr(model, "head_type", "analytic") == "direct"
+    if not project_state and (not direct or guarded):
+        raise ValueError("Unprojected diagnostics require a direct head without a guard")
     lam, elapsed = start.clone(), start.new_zeros(len(start))
     nfe = torch.zeros(len(start), dtype=torch.long, device=start.device)
     backtracks, interventions = torch.zeros_like(nfe), torch.zeros_like(nfe)
@@ -128,6 +162,9 @@ def run_cfm(model, problem, start, calls, guarded=False, max_backtracks=12):
     next_h = torch.full_like(elapsed, 1.0 / calls)
     accepted_steps = torch.zeros_like(nfe)
     minimum_h = torch.full_like(elapsed, float("inf"))
+    clipped_entries, projection_steps = torch.zeros_like(nfe), torch.zeros_like(nfe)
+    projection_l1, projection_max = torch.zeros_like(elapsed), torch.zeros_like(elapsed)
+    minimum_raw = torch.full_like(elapsed, float("inf"))
     failure_code = torch.zeros_like(nfe)  # 0=complete, 1=guard, 2=budget, 3=nonfinite, 4=negative endpoint
     for _ in range(calls * 64):
         active = (elapsed < 1) & ~failed
@@ -136,23 +173,37 @@ def run_cfm(model, problem, start, calls, guarded=False, max_backtracks=12):
         remaining = 1 - elapsed
         h = (torch.minimum(remaining, next_h) if guarded else
              ((accepted_steps + 1).to(lam.dtype) / calls).clamp_max(1) - elapsed)
-        endpoint = model.endpoint(lam, elapsed, problem)
+        # Completed rows may coexist with active rows in a guarded batch. A
+        # direct field must never be called at tau=1, even for ignored rows.
+        evaluation_time = torch.where(active, elapsed, torch.zeros_like(elapsed)) if direct else elapsed
+        output = _solver_output(model, problem, lam, evaluation_time)
         nfe += active.long()
-        nonfinite = ~torch.isfinite(endpoint).all(-1)
-        negative = (endpoint < 0).any(-1)
+        nonfinite = (~torch.isfinite(output) & problem["mask"]).any(-1)
+        negative = ((output < 0) & problem["mask"]).any(-1) if not direct else torch.zeros_like(active)
         invalid = active & (nonfinite | negative)
         failed |= invalid
         failure_code = torch.where(invalid, torch.where(nonfinite, 3, 4), failure_code)
         pending = active & ~invalid
         old_q = value(problem, lam)
         for retry in range(max_backtracks + 1 if guarded else 1):
-            candidate = advance_endpoint(lam, endpoint, elapsed, h)
+            candidate, raw_candidate = _advance_output(
+                model, problem, lam, output, elapsed, h, project_state)
             candidate_q = value(problem, candidate)
-            acceptable = torch.isfinite(candidate).all(-1) & torch.isfinite(candidate_q)
+            acceptable = torch.isfinite(raw_candidate).all(-1) & torch.isfinite(candidate_q)
             if guarded:
                 allowance = 32 * torch.finfo(lam.dtype).eps * old_q.abs().clamp_min(1e-8)
                 acceptable &= (candidate >= 0).all(-1) & (candidate_q <= old_q + allowance)
             accept = pending & acceptable
+            if direct and collect_diagnostics:
+                correction = (candidate - raw_candidate).abs()
+                clipped = (correction > 0) & problem["mask"]
+                clipped_entries += torch.where(accept, clipped.sum(-1), 0)
+                projection_steps += (accept & clipped.any(-1)).long()
+                projection_l1 += torch.where(accept, correction.sum(-1), 0)
+                projection_max = torch.maximum(projection_max,
+                    torch.where(accept, correction.amax(-1), 0))
+                valid_min = raw_candidate.masked_fill(~problem["mask"], float("inf")).amin(-1)
+                minimum_raw = torch.where(accept, torch.minimum(minimum_raw, valid_min), minimum_raw)
             lam = torch.where(accept[:, None], candidate, lam)
             elapsed = torch.where(accept, (elapsed + h).clamp_max(1), elapsed)
             accepted_steps += accept.long()
@@ -174,4 +225,7 @@ def run_cfm(model, problem, start, calls, guarded=False, max_backtracks=12):
                 neural_evals=nfe * model.neural_evaluations,
                 backtracks=backtracks, interventions=interventions,
                 accepted_steps=accepted_steps, failure_code=failure_code,
-                min_accepted_h=torch.where(accepted_steps > 0, minimum_h, 0))
+                min_accepted_h=torch.where(accepted_steps > 0, minimum_h, 0),
+                clipped_entries=clipped_entries, projection_steps=projection_steps,
+                projection_l1=projection_l1, projection_max=projection_max,
+                min_unprojected_multiplier=torch.where(torch.isfinite(minimum_raw), minimum_raw, 0))

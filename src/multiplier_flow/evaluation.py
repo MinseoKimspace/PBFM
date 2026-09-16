@@ -42,6 +42,96 @@ def summarize(problem, lam, optimum, tolerance):
     return report
 
 
+def projection_summary(result, index=None):
+    """Reduce accepted-step projection diagnostics, preserving their units.
+
+    Projection is part of direct-head inference. These counters measure its
+    magnitude; they are not additional convergence criteria or solver work.
+    """
+    report = {}
+    for key in ("clipped_entries", "projection_steps", "projection_l1",
+                "projection_max", "min_unprojected_multiplier"):
+        if key not in result:
+            continue
+        values = result[key] if index is None else result[key][index:index+1]
+        if key == "projection_max":
+            value = values.max()
+        elif key == "min_unprojected_multiplier":
+            value = values.min()
+        else:
+            value = values.sum()
+        report[key] = int(value) if key in ("clipped_entries", "projection_steps") else float(value)
+    if "projection_steps" in report and "accepted_steps" in result:
+        steps = result["accepted_steps"]
+        accepted = int((steps if index is None else steps[index:index+1]).sum())
+        report["projection_step_fraction"] = report["projection_steps"] / max(1, accepted)
+    return report
+
+
+def collect_projection_diagnostics(model, problem, start, calls, result,
+                                   guarded=False, max_backtracks=12):
+    """Repeat a deterministic direct solve outside timing to collect counters.
+
+    The timed solve still evaluates the actual field, projection and safety
+    checks. Only reductions used for reporting move to this separate pass.
+    """
+    diagnostic = run_cfm(model, problem, start, calls, guarded, max_backtracks,
+                         collect_diagnostics=True)
+    if (not torch.equal(result["final"], diagnostic["final"])
+            or not torch.equal(result["completed"], diagnostic["completed"])):
+        raise RuntimeError("Diagnostic replay changed the solver result; timings and diagnostics must describe the same deterministic solve")
+    for key in ("clipped_entries", "projection_steps", "projection_l1",
+                "projection_max", "min_unprojected_multiplier"):
+        result[key] = diagnostic[key]
+
+
+def start_mode_description(mode):
+    if mode == "zero":
+        return "Primary solver evaluation: zero initialization, no reference endpoint input"
+    return "Diagnostic only: initialization is constructed using the reference endpoint"
+
+
+def aggregate_projection_rows(rows):
+    """Aggregate the same counters across scenes or physical frames."""
+    report = {}
+    for key in ("clipped_entries", "projection_steps", "projection_l1",
+                "projection_max", "min_unprojected_multiplier"):
+        values = [row[key] for row in rows if key in row]
+        if not values:
+            continue
+        report[key] = (max(values) if key == "projection_max" else
+                       min(values) if key == "min_unprojected_multiplier" else sum(values))
+    if "projection_steps" in report:
+        accepted = sum(row.get("accepted_steps", 0) for row in rows)
+        report["projection_step_fraction"] = report["projection_steps"] / max(1, accepted)
+    return report
+
+
+def unclipped_summary(model, problem, start, calls, tolerance, optimum=None):
+    """Untimed direct-field counterfactual; never replaces the projected result."""
+    result = run_cfm(model, problem, start, calls, project_state=False)
+    stats = residuals(problem, result["final"])
+    completed = result["completed"]
+    success = completed & converged(problem, result["final"], tolerance)
+    report = dict(scope="Diagnostic only: direct Euler without multiplier projection; excluded from primary performance",
+                  samples=len(start), completed_count=int(completed.sum()),
+                  success_count=int(success.sum()),
+                  max_penetration=float(stats["penetration"].max()),
+                  max_projected_gradient=float(stats["projected_gradient"].max()),
+                  max_negative_multiplier=float(stats["negative_multiplier"].max()),
+                  **projection_summary(result))
+    if optimum is not None:
+        report["projection_position_mse"] = float(position_error(problem, result["final"], optimum).mean())
+    report["per_scene"] = [dict(completed=bool(completed[i]), success=bool(success[i]),
+        failure_code=int(result["failure_code"][i]), accepted_steps=int(result["accepted_steps"][i]),
+        time=float(result["time"][i]),
+        projected_gradient=float(stats["projected_gradient"][i]),
+        penetration=float(stats["penetration"][i]),
+        negative_multiplier=float(stats["negative_multiplier"][i]),
+        **projection_summary(result, i)) for i in range(len(start))]
+    return report
+
+
 def scene_indices(names, limit=0):
     """Zero means ALL. A limit uses round-robin groups, never a prefix slice."""
     if limit < 0:
@@ -63,7 +153,8 @@ def group_summary(rows):
     return {name: dict(samples=len(items), success_count=sum(x["success_count"] for x in items),
                        projected_gradient=sum(x["projected_gradient"] for x in items)/len(items),
                        max_penetration=max(x["max_penetration"] for x in items),
-                       projection_position_mse=sum(x["projection_position_mse"] for x in items)/len(items))
+                       projection_position_mse=sum(x["projection_position_mse"] for x in items)/len(items),
+                       **aggregate_projection_rows(items))
             for name, items in groups.items()}
 
 
@@ -92,10 +183,13 @@ def solver_validation(model, split, config, device):
             single = deepcopy(config)
             single["train"]["validation_calls"] = calls
             reports[str(calls)] = solver_validation(model, split, single, device)
-        return dict(by_calls=reports, selection="Equal weight per NFE budget and scene/source group",
+        return dict(by_calls=reports, selection="Equal weight per NFE budget and scene/source group; includes reference-derived diagnostic starts for historical comparability",
             balanced=dict(groups=sum(report["balanced"]["groups"] for report in reports.values()),
                 success_rate=sum(report["balanced"]["success_rate"] for report in reports.values())/len(reports),
-                mean_projected_gradient=sum(report["balanced"]["mean_projected_gradient"] for report in reports.values())/len(reports)))
+                mean_projected_gradient=sum(report["balanced"]["mean_projected_gradient"] for report in reports.values())/len(reports)),
+            primary_zero=dict(groups=sum(report["primary_zero"]["groups"] for report in reports.values()),
+                success_rate=sum(report["primary_zero"]["success_rate"] for report in reports.values())/len(reports),
+                mean_projected_gradient=sum(report["primary_zero"]["mean_projected_gradient"] for report in reports.values())/len(reports)))
     settings = config["evaluation"]
     report, all_rows = {}, []
     for mode in settings["start_modes"]:
@@ -111,6 +205,8 @@ def solver_validation(model, split, config, device):
                     optimum[j:j+1], settings["tolerance"]))
                 row["completed"] = bool(result["completed"][j])
                 row["success_count"] *= int(row["completed"])
+                row["accepted_steps"] = int(result["accepted_steps"][j])
+                row.update(projection_summary(result, j))
                 rows.append(row)
         report[mode] = group_summary(rows)
         all_rows.extend(x for x in rows if not x["name"].startswith("free_flight"))
@@ -122,6 +218,12 @@ def solver_validation(model, split, config, device):
     report["balanced"] = dict(groups=len(groups),
         success_rate=sum(g["success_count"]/g["samples"] for g in groups)/max(1, len(groups)),
         mean_projected_gradient=sum(g["projected_gradient"] for g in groups)/max(1, len(groups)))
+    zero_groups = [stats for name, stats in report.get("zero", {}).items()
+                   if not name.startswith("free_flight")]
+    report["primary_zero"] = dict(groups=len(zero_groups),
+        success_rate=sum(g["success_count"]/g["samples"] for g in zero_groups)/max(1, len(zero_groups)),
+        mean_projected_gradient=sum(g["projected_gradient"] for g in zero_groups)/max(1, len(zero_groups)))
+    report["start_mode_roles"] = {mode: start_mode_description(mode) for mode in settings["start_modes"]}
     return report
 
 
@@ -190,6 +292,7 @@ def preflight(config, output):
     slope = (gap(problem, start) * field(problem, start)).sum(-1)
     rebound = relinearization_check()
     report = dict(scope="Frozen-normal dual QP; no learned model or PBD finish",
+                  head_type=config["model"].get("head_type", "analytic"),
                   relinearization=rebound, independent_oracle_position_mse=oracle_errors,
                   initial_Q_directional_derivative=slope.tolist(), cases={},
                   pgs=dict(seconds=qp_seconds, sweeps=qp["sweeps"].tolist(),
@@ -215,7 +318,10 @@ def preflight(config, output):
     # An exact coupling rate must reproduce the same CFM straight path, even
     # when a multiplier needs to decrease. This is a representability check,
     # NOT a claim about an untrained network's coupled-contact accuracy.
-    net = ConditionalField(**config["model"]).double()
+    # The analytic baseline keeps its exact isolated-contact property. Direct
+    # heads are not expected to solve any contact before learning.
+    analytic_settings = dict(config["model"], head_type="analytic")
+    net = ConditionalField(**analytic_settings).double()
     scalar = select(problem, slice(0, 3))
     with torch.no_grad():
         net.head.bias.fill_(100.)  # Isolated contact cannot depend on this head.
@@ -237,6 +343,39 @@ def preflight(config, output):
         passed=isolated_error < 1e-12 and max(matching_error) < 1e-4 and max(endpoint_error) < 1e-10,
         scope="Isolated analytic solve + exact-coupling representability; not learned performance")
     report["passed"] &= report["structured_head"]["passed"]
+    if config["model"].get("head_type", "analytic") == "direct":
+        class ExactVelocity:
+            head_type = "direct"
+            neural_evaluations = 1
+
+            def __call__(self, state, tau, fixed_problem):
+                return exact_rate * fixed_problem["mask"]
+
+        # A constant signed CFM target integrates the straight path exactly.
+        # This checks the deployed projected update, not untrained accuracy.
+        direct_errors, clipping = [], []
+        for calls in (1, 4):
+            result = run_cfm(ExactVelocity(), problem, start, calls)
+            direct_errors.append(float((result["final"] - qp["final"]).abs().max()))
+            clipping.append(projection_summary(result))
+        direct_net = ConditionalField(**config["model"]).double()
+        with torch.no_grad():
+            direct_net.head.weight.zero_()
+            direct_net.head.bias.fill_(-1.)
+            signed_output = direct_net(start, torch.zeros(len(start), dtype=start.dtype), problem)
+        negative_output = bool((signed_output[problem["mask"]] < 0).any())
+        padding_zero = bool((signed_output[~problem["mask"]] == 0).all())
+        report["direct_head"] = dict(
+            controlled_velocity_has_positive=bool((exact_rate > 0).any()),
+            controlled_velocity_has_negative=bool((exact_rate < 0).any()),
+            exact_velocity_endpoint_max_error=max(direct_errors),
+            signed_neural_output=negative_output, padded_output_zero=padding_zero,
+            projection_by_calls=dict(zip(("1", "4"), clipping)),
+            scope="Controlled signed velocity and projected straight-path integration; not untrained solver accuracy")
+        report["direct_head"]["passed"] = bool(
+            (exact_rate > 0).any() and (exact_rate < 0).any()
+            and max(direct_errors) < 1e-10 and negative_output and padding_zero)
+        report["passed"] &= report["direct_head"]["passed"]
     report["cost_note"] = "PGS labels and independent oracle use CPU float64; no CFM speed claim"
     write_json(output, report)
     return report
@@ -255,32 +394,51 @@ def evaluate(model, split, config, device, output, metadata=None):
     problem = move(problem64, device, torch.float32)
     optimum64 = split["optimum"][contexts]
     optimum = optimum64.to(device=device, dtype=torch.float32)
-    report = dict(scope=SOLVER_DESCRIPTION,
+    direct = getattr(model, "head_type", "analytic") == "direct"
+    report = dict(scope=getattr(model, "solver_description", SOLVER_DESCRIPTION),
                   model_format=getattr(model, "checkpoint_format", CHECKPOINT_FORMAT),
-                  device=str(device), tau_interval=[0., 1.], integrator="convex-combination Euler", scenes=names,
-                  raw_definition="Analytic contact projection is in the head; no EXTRA guard/finish",
-                  local_definition="No neural coupling; same projected endpoint and tau schedule, not native Jacobi",
+                  head_type=getattr(model, "head_type", "analytic"),
+                  device=str(device), tau_interval=[0., 1.],
+                  integrator="projected explicit Euler" if direct else "convex-combination Euler", scenes=names,
+                  raw_definition=("Signed direct velocity; project multipliers after every Euler step; no Q guard or finish"
+                                  if direct else "Analytic contact projection is in the head; no EXTRA guard/finish"),
+                  local_definition="Analytic local endpoint with zero neural coupling and the same tau schedule; not native Jacobi",
                   guard_version="cfm_euler_Q_nonnegative_v1", modes={},
-                  timings_include="Solver/guard only; exclude geometry setup and label generation",
-                  cost_units="NFE is endpoint evaluations; neural_evals excludes local ablation; seconds measure the complete batch",
+                  start_mode_roles={mode: start_mode_description(mode) for mode in settings["start_modes"]},
+                  primary_start_mode="zero",
+                  timings_include="Solver including neural features, updates/projection and optional guard; exclude geometry setup, labels, projection-counter reductions and unclipped diagnostics",
+                  cost_units="NFE is field/endpoint evaluations; neural_evals excludes local ablation; seconds measure the complete batch",
+                  projection_diagnostics="Direct-head state projection on accepted steps only (not analytic endpoint ReLU): clipped_entries counts valid negative coordinates; projection_steps counts steps with clipping; projection_l1 sums corrections; projection_max is the largest correction",
                   config=config, metadata=metadata or {},
                   float64_label_quality=summarize(problem64, optimum64, optimum64, settings["tolerance"]))
     for mode in settings["start_modes"]:
         start = evaluation_start(problem, optimum, mode)
         rows = {}
+        raw_budgets = {}
+        diagnostic_specs = {}
         operations = {"pgs": lambda: pgs(problem, start, settings["tolerance"], ref["max_sweeps"])}
         for calls in settings["calls"]:
             for guarded in ([False, True] if settings.get("guarded", False) else [False]):
                 local_name = f"local_k{calls}_{'guarded' if guarded else 'raw'}"
                 operations[local_name] = lambda k=calls, safe=guarded: run_cfm(
-                    LocalProjection(), problem, start, k, safe, settings["max_backtracks"])
+                    LocalProjection(), problem, start, k, safe, settings["max_backtracks"],
+                    collect_diagnostics=False)
                 name = f"cfm_k{calls}_{'guarded' if guarded else 'raw'}"
                 operations[name] = lambda k=calls, safe=guarded: run_cfm(
-                    model, problem, start, k, safe, settings["max_backtracks"])
+                    model, problem, start, k, safe, settings["max_backtracks"],
+                    collect_diagnostics=False)
+                if direct:
+                    diagnostic_specs[name] = (calls, guarded)
+                if direct and not guarded:
+                    raw_budgets[name] = calls
         for name, operation in operations.items():
             operation()
             measurements = [timed(device, operation) for _ in range(settings["timing_repeats"])]
             result = measurements[-1][0]
+            if name in diagnostic_specs:
+                calls, guarded = diagnostic_specs[name]
+                collect_projection_diagnostics(model, problem, start, calls, result,
+                                               guarded, settings["max_backtracks"])
             row = summarize(problem, result["final"], optimum, settings["tolerance"])
             row["seconds"] = sum(item[1] for item in measurements) / len(measurements)
             row["timing_repeats"] = len(measurements)
@@ -288,9 +446,10 @@ def evaluate(model, split, config, device, output, metadata=None):
             row["converged_count"] = row["success_count"]
             row["success_count"] = int((completed & converged(problem, result["final"], settings["tolerance"])).sum())
             row["completed_count"] = int(completed.sum())
-            for key in ("nfe", "neural_evals", "sweeps", "contact_evals", "backtracks", "interventions"):
+            for key in ("nfe", "neural_evals", "sweeps", "contact_evals", "backtracks", "interventions", "accepted_steps"):
                 if key in result:
                     row[key] = int(result[key].sum())
+            row.update(projection_summary(result))
             row["per_scene"] = []
             for i in range(count):
                 scene = dict(name=names[i], **summarize(select(problem, slice(i, i+1)),
@@ -301,8 +460,15 @@ def evaluate(model, split, config, device, output, metadata=None):
                 for key in ("time", "nfe", "neural_evals", "backtracks", "interventions", "accepted_steps", "min_accepted_h", "failure_code"):
                     if key in result:
                         scene[key] = result[key][i].item()
+                scene.update(projection_summary(result, i))
                 row["per_scene"].append(scene)
             row["groups"] = group_summary(row["per_scene"])
+            if name in raw_budgets:
+                diagnostic = unclipped_summary(model, problem, start, raw_budgets[name],
+                                               settings["tolerance"], optimum)
+                for scene_name, scene in zip(names, diagnostic["per_scene"]):
+                    scene["name"] = scene_name
+                row["unclipped_diagnostic"] = diagnostic
             rows[name] = row
             if settings["render"] and mode == "zero":
                 render_case(select(problem, slice(0, 1)), start[:1], result["final"][:1],
