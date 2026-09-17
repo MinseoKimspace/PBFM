@@ -235,6 +235,70 @@ Profile은 고정 tau와 초기 가중치에서의 측정이며 전체 학습의
 
 ## 7. 평가와 해석
 
+### 동일 반복 예산 평가
+
+`evaluation.calls: [1, 2, 4, 8, 16, 32, 64]`의 각 K에서 같은 고정 QP와
+같은 초기 multiplier를 사용해 다음을 평가한다.
+
+- `cfm_kK_raw`: [0,1]을 K구간으로 나누어 정확히 K NFE를 실행한다.
+- `pgs_kK_fixed`: 모든 접촉을 순서대로 갱신하는 sweep을 정확히 K회 실행한다.
+  중간에 수렴해도 계속 실행한다. 예산 소진 후 추가 PGS 마무리는 없다.
+- `local_kK_raw`: 신경망 보정이 없는 기존 analytic head와 같은 FM 시간 스케줄이다.
+- `pgs`: 기존 tolerance 조기 종료 기준선이다. 위의 고정 K 결과와 별도로 기록한다.
+
+CFM NFE 하나는 전역 신경망과 head/update를 포함하고, PGS sweep 하나는 접촉별 순차
+갱신을 포함한다. 반복 수가 같아도 계산량은 다르다. Raw CFM이 유한 상태로 완주했을 때
+NFE=K이며, 선택적 guarded 결과는 동일 예산 표에 포함하지 않는다.
+
+```powershell
+# 기존 D checkpoint와 공통 cache로 재평가한다. 재학습은 필요 없다.
+python eval_multiplier.py --config configs/multiplier_cfm_ablation.yaml --variant D --checkpoint best_solver --device cuda --no-render
+
+# 평가 예산/반복 측정 횟수만 명시적으로 바꿀 수도 있다.
+python eval_multiplier.py --config configs/multiplier_cfm_ablation.yaml --variant D --calls 4 8 16 32 64 --timing-repeats 10 --no-render --device cuda
+```
+
+기본 출력은 `runs/multiplier_cfm_ablation/D/cfm/eval_test_best_solver_budget.json`과
+같은 이름의 `.md` 요약 표다. 기존 `eval_test_best_solver.json`은 덮어쓰지 않는다.
+이미 생성한 budget 결과도 보존하려면 `--output reports/another_budget.json`을 사용한다.
+데이터나 모델 설정이 checkpoint와 같아야 한다. 학습/선택 규칙은 이번 평가 변경으로 바뀌지 않는다.
+
+JSON의 각 `modes.<start>.<method>`는 다음을 기록한다.
+
+| 항목 | 의미 |
+|---|---|
+| `accuracy.success_rate` | KKT 잔차·침투·음수 multiplier가 `evaluation.tolerance` 이내이고 실행을 완주한 비율 |
+| `accuracy.projected_gradient` | QP별 잔차의 평균·중앙값·p95·최대값 |
+| `accuracy.position_rmse` | 원래 float64 기준해와 비교한 질량 가중 좌표 RMSE의 분포 |
+| `accuracy.position_within_tolerance_rate` | 위치 RMSE가 `position_tolerance` 이내이고 완주한 비율; KKT 성공률과 별개 |
+| `accuracy.position_normalized_rmse` | 위치 RMSE를 고정 `length_scale`로 나눈 무차원 오차 |
+| `accuracy.objective_gap` | 원래 float64 QP에서 계산한 `Q(pred)-Q(reference)`의 분포; 부호 유지 |
+| `accuracy.multiplier_rmse` | 유효 접촉의 multiplier RMSE; 해의 비유일성 때문에 보조 지표로 사용 |
+| `cost` | 논리 NFE·신경망 호출·PGS sweep·유효 접촉 갱신 수, 실제 배치 호출 수, 패딩 토큰/attention score 수, 파라미터 수 |
+| `timing` | 모든 반복의 시간, 평균·중앙값·최소·최대·표준편차, QP당 분할 시간·처리량 |
+| `groups` / `per_scene` | 장면 유형·크기별 및 개별 QP의 오차/정확도와 계산 횟수 |
+
+`fixed_budget_comparison.<start>.<K>`에는 동일 문제별 CFM-only/PGS-only 성공 수,
+CFM의 잔차/위치 오차가 더 작은 문제 수, 동일 예산의 시간 비율을 저장한다.
+이 시간 비율은 정확도가 동일하다는 뜻이 아니다. `zero`를 주 평가로 사용한다.
+`over/mixed`는 기준해로 초기값을 만든 진단이다.
+
+위치 RMSE는 좌표별 질량으로 가중한 제곱 오차의 평균에 제곱근을 취한다.
+고정 기준 길이로 정규화하며, `1-error` 같은 임의의 정확도 백분율로 바꾸지 않는다.
+기준해 위치 오차 계산은 원본 float64 QP/label과 solver의 float32 출력을 비교한다.
+기존 KKT 성공 판정은 실제 실행한 float32 QP에서 유지한다.
+
+시간은 각 방법을 한 번 워밍업한 뒤, 기본 5회 측정한다. CUDA는 측정 전후에 synchronize한다.
+solver에 필요한 특징·head·갱신·검사는 포함하지만 geometry 생성, decode, 정답 생성,
+보고용 통계·projection 진단 재실행은 제외한다. QP당 시간은 배치 시간을 나눈 처리량 지표이며
+단일 문제의 지연 시간이 아니다. 하드웨어·PyTorch·dtype·TF32 설정도 기록한다.
+`cost`는 명시적 연산 횟수이며 FLOPs 추정치가 아니다. 특히 attention은 mask 적용 전에
+실제로 계산되는 패딩을 포함한 score 원소 수를 기록한다.
+
+동일 QP 비교는 frozen-QP 평가에 추가했다. Physical rollout은 solver별 궤적이 달라져
+이후 QP도 달라지므로 기존 별도 평가로 유지한다. D의 수식과 학습 과정은
+[D 방식 상세 설명](docs/D_METHOD.md)에 정리했다.
+
 `best.pt`는 고정 샘플 CFM validation loss로 선택한다.
 `best_solver.pt`는 validation의 장면 유형·물체 수·source 유형과
 호출 예산 `[1,2,4]`를 균등하게 반영한 성공률을 우선하고 projected-gradient 잔차로 동률을 해소한다.

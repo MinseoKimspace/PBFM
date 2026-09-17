@@ -79,18 +79,27 @@ def integrate_cfm(model, problem, start, calls, *, start_step=0, end_step=None,
 
 
 @torch.no_grad()
-def pgs(problem, start, tolerance=1e-7, max_sweeps=10000):
-    """Projected coordinate descent on Q; negative multiplier increments allowed."""
-    if tolerance <= 0 or max_sweeps < 1:
+def pgs(problem, start, tolerance=1e-7, max_sweeps=10000, *, stop_at_tolerance=True):
+    """Projected coordinate descent; one sweep visits every contact in order.
+
+    Reference solves stop each world at tolerance (the historical default).
+    Fixed-budget comparisons set stop_at_tolerance=False: exactly max_sweeps
+    full sweeps, including worlds already solved. No hidden finishing solve.
+    Padding is visited by the dense implementation but is not a contact update.
+    """
+    if tolerance <= 0 or type(max_sweeps) is not int or max_sweeps < 1:
         raise ValueError("Positive tolerance and sweep budget required")
     lam = start.clone()
     diagonal = problem["D"].diagonal(dim1=1, dim2=2).clamp_min(1e-30)
     sweeps = torch.zeros(len(lam), dtype=torch.long, device=lam.device)
     updates = torch.zeros_like(sweeps)
     for _ in range(max_sweeps):
-        active = ~converged(problem, lam, tolerance)
-        if not active.any():
-            break
+        if stop_at_tolerance:
+            active = ~converged(problem, lam, tolerance)
+            if not active.any():
+                break
+        else:
+            active = torch.ones(len(lam), dtype=torch.bool, device=lam.device)
         g = gap(problem, lam)
         for i in range(lam.shape[1]):
             enabled = active & problem["mask"][:, i]

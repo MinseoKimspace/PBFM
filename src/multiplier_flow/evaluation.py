@@ -9,6 +9,9 @@ from time import perf_counter
 import torch
 
 from src.contact_flow.physics import PhysicsConfig
+from .benchmark import (accuracy_summary, budget_comparison, reference_errors,
+                        runtime_environment, timing_summary, validate_budgets,
+                        work_summary, write_budget_table)
 from .data import release_problem
 from .model import CHECKPOINT_FORMAT, SOLVER_DESCRIPTION, ConditionalField, LocalProjection
 from .problem import (circle_problem, contact_endpoint, converged, decode, field, gap,
@@ -385,6 +388,9 @@ def preflight(config, output):
 @torch.no_grad()
 def evaluate(model, split, config, device, output, metadata=None):
     ref, settings = config["reference"], config["evaluation"]
+    budgets = validate_budgets(settings)
+    position_tolerance = float(settings.get("position_tolerance", settings["tolerance"]))
+    model.eval()
     contexts = scene_indices(split["names"], int(settings["max_scenes"]))
     names = [split["names"][int(i)] for i in contexts]
     count = len(contexts)
@@ -410,6 +416,16 @@ def evaluate(model, split, config, device, output, metadata=None):
                   cost_units="NFE is field/endpoint evaluations; neural_evals excludes local ablation; seconds measure the complete batch",
                   projection_diagnostics="Direct-head state projection on accepted steps only (not analytic endpoint ReLU): clipped_entries counts valid negative coordinates; projection_steps counts steps with clipping; projection_l1 sums corrections; projection_max is the largest correction",
                   config=config, metadata=metadata or {},
+                  environment=runtime_environment(device, model),
+                  fixed_budget=dict(budgets=budgets,
+                      cfm="Exactly K raw Euler field evaluations on [0,1]; no PGS finish",
+                      pgs="Exactly K sequential full-contact sweeps; no early stopping",
+                      comparison_scope="Identical frozen QPs and initial states; equal iteration counts, not equal compute",
+                      reference="Original float64 cached PGS endpoints; no reference input for zero-start",
+                      position_accuracy="Mass-weighted per-coordinate position RMSE <= position_tolerance; separate from KKT success",
+                      objective_gap="Signed Q(prediction)-Q(reference), recomputed on original float64 QP",
+                      multiplier_error="Diagnostic only; redundant constraints can make multipliers nonunique"),
+                  fixed_budget_comparison={},
                   float64_label_quality=summarize(problem64, optimum64, optimum64, settings["tolerance"]))
     for mode in settings["start_modes"]:
         start = evaluation_start(problem, optimum, mode)
@@ -417,7 +433,9 @@ def evaluate(model, split, config, device, output, metadata=None):
         raw_budgets = {}
         diagnostic_specs = {}
         operations = {"pgs": lambda: pgs(problem, start, settings["tolerance"], ref["max_sweeps"])}
-        for calls in settings["calls"]:
+        for calls in budgets:
+            operations[f"pgs_k{calls}_fixed"] = lambda k=calls: pgs(
+                problem, start, settings["tolerance"], k, stop_at_tolerance=False)
             for guarded in ([False, True] if settings.get("guarded", False) else [False]):
                 local_name = f"local_k{calls}_{'guarded' if guarded else 'raw'}"
                 operations[local_name] = lambda k=calls, safe=guarded: run_cfm(
@@ -442,6 +460,9 @@ def evaluate(model, split, config, device, output, metadata=None):
             row = summarize(problem, result["final"], optimum, settings["tolerance"])
             row["seconds"] = sum(item[1] for item in measurements) / len(measurements)
             row["timing_repeats"] = len(measurements)
+            row["timing"] = timing_summary([item[1] for item in measurements], count)
+            row["cost"] = work_summary(result, problem, model if name.startswith("cfm_") else None)
+            errors = reference_errors(problem64, result["final"], optimum64, model.length_scale)
             completed = result.get("completed", torch.ones(count, dtype=torch.bool, device=device))
             row["converged_count"] = row["success_count"]
             row["success_count"] = int((completed & converged(problem, result["final"], settings["tolerance"])).sum())
@@ -457,12 +478,17 @@ def evaluate(model, split, config, device, output, metadata=None):
                 scene["converged_count"] = scene["success_count"]
                 scene["success_count"] *= int(completed[i])
                 scene["completed"] = bool(completed[i])
-                for key in ("time", "nfe", "neural_evals", "backtracks", "interventions", "accepted_steps", "min_accepted_h", "failure_code"):
+                for key in ("time", "nfe", "neural_evals", "sweeps", "contact_evals", "backtracks", "interventions", "accepted_steps", "min_accepted_h", "failure_code"):
                     if key in result:
                         scene[key] = result[key][i].item()
                 scene.update(projection_summary(result, i))
+                scene.update({key: float(values[i]) for key, values in errors.items()})
                 row["per_scene"].append(scene)
+            row["accuracy"] = accuracy_summary(row["per_scene"], position_tolerance)
             row["groups"] = group_summary(row["per_scene"])
+            for group, stats in row["groups"].items():
+                members = [scene for scene in row["per_scene"] if scene["name"].rsplit("_", 1)[0] == group]
+                stats["accuracy"] = accuracy_summary(members, position_tolerance)
             if name in raw_budgets:
                 diagnostic = unclipped_summary(model, problem, start, raw_budgets[name],
                                                settings["tolerance"], optimum)
@@ -470,12 +496,14 @@ def evaluate(model, split, config, device, output, metadata=None):
                     scene["name"] = scene_name
                 row["unclipped_diagnostic"] = diagnostic
             rows[name] = row
-            if settings["render"] and mode == "zero":
+            if settings["render"] and mode == "zero" and not name.startswith("pgs_k"):
                 render_case(select(problem, slice(0, 1)), start[:1], result["final"][:1],
                             split["radii"][int(contexts[0])], config, Path(output).parent / "renders" / f"{name}.png", name)
         report["modes"][mode] = rows
+        report["fixed_budget_comparison"][mode] = budget_comparison(rows, budgets)
     if settings.get("recovery", {}).get("enabled", False):
         from .recovery import recovery_evaluation
         report["recovery"] = recovery_evaluation(model, split, config, device)
     write_json(output, report)
+    write_budget_table(report, Path(output).with_suffix(".md"))
     return report
