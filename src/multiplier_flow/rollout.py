@@ -1,8 +1,9 @@
-"""Physical-time diagnostic around the frozen-normal PGS/CFM solve.
+"""Physical-time diagnostic around frozen-normal PGS, CFM and hybrid solves.
 
 Rebuild contacts each physical frame, start lambda=0, update velocity by FD.
 No relinearization inside a frame, restitution, friction, CCD resolution,
 warm-start transfer, position/velocity clipping, or hidden finishing solver.
+Explicit hybrid methods finish each complete FM map with PGS on the same QP.
 Analytic CFM projects inside its endpoint head; direct CFM projects multiplier
 states after Euler updates. Geometric/swept checks only measure errors; they
 NEVER correct the trajectory.
@@ -16,11 +17,22 @@ import torch
 
 from src.contact_flow.dynamics import free_position, finite_difference_state
 from src.contact_flow.physics import PhysicsConfig, geometry, valid_positions
+from .benchmark import hybrid_budgets
 from .evaluation import (aggregate_projection_rows, collect_projection_diagnostics,
                          projection_summary, timed, unclipped_summary, write_json)
 from .model import CHECKPOINT_FORMAT, SOLVER_DESCRIPTION, LocalProjection
 from .problem import converged, decode, gap, make_problem, pack, position_error, residuals
-from .solvers import pgs, run_cfm
+from .solvers import pgs, run_cfm, run_hybrid
+
+
+def rollout_budgets(settings):
+    """Validate independent standalone and hybrid FM budgets."""
+    calls = settings["calls"]
+    if (not isinstance(calls, (list, tuple)) or not calls
+            or any(type(k) is not int or k < 1 for k in calls)
+            or len(set(calls)) != len(calls)):
+        raise ValueError("rollout.calls must contain distinct positive integers")
+    return list(calls), hybrid_budgets(settings, scope="rollout")
 
 
 def motion_scenes(physics):
@@ -64,7 +76,15 @@ def build_frame_problem(proposal, radius, physics, eta_fraction):
 
 
 @torch.no_grad()
-def simulate(initial, radius, config, device, model=None, calls=1, guarded=False):
+def simulate(initial, radius, config, device, model=None, calls=1, guarded=False, *, hybrid=False):
+    """Advance physical frames only after the requested solver has finished.
+
+    Each frame builds one QP and starts lambda at zero. A hybrid passes its FM
+    endpoint to PGS without rebuilding contacts or using the diagnostic oracle.
+    Tolerance-stopped PGS failures abort the frame; raw FM may finish above tol.
+    """
+    if hybrid and (model is None or guarded):
+        raise ValueError("Hybrid rollout requires a model and unguarded FM")
     physics = PhysicsConfig(**config["physics"])
     settings, ref = config["rollout"], config["reference"]
     tolerance = config["evaluation"]["tolerance"]
@@ -86,20 +106,47 @@ def simulate(initial, radius, config, device, model=None, calls=1, guarded=False
         def solve():
             if model is None:
                 return pgs(problem, start, tolerance, ref["max_sweeps"])
+            if hybrid:
+                return run_hybrid(model, problem, start, calls, tolerance, ref["max_sweeps"])
             return run_cfm(model, problem, start, calls,
                            guarded, settings.get("max_backtracks", 8), collect_diagnostics=False)
         result, solver_seconds = timed(device, solve)
         if getattr(model, "head_type", "analytic") == "direct":
-            collect_projection_diagnostics(model, problem, start, calls, result,
+            # The replay must check the FM endpoint, not the PGS-finished state.
+            diagnostic = (dict(final=result["cfm_final"], completed=result["cfm_completed"])
+                          if hybrid else result)
+            collect_projection_diagnostics(model, problem, start, calls, diagnostic,
                                            guarded, settings.get("max_backtracks", 8))
-        counters = {key: int(result[key].sum()) for key in
-                    ("nfe", "neural_evals", "backtracks", "interventions", "sweeps", "contact_evals", "accepted_steps") if key in result}
+            if hybrid:
+                result.update({key: value for key, value in diagnostic.items()
+                               if key not in ("final", "completed")})
+        counters = {key: int(result[key].sum()) if key in result else 0 for key in
+                    ("nfe", "neural_evals", "backtracks", "interventions", "sweeps", "contact_evals", "accepted_steps")}
         counters.update(projection_summary(result))
+        local_stats = residuals(problem, result["final"])
+        solver_completed = bool(result["completed"].all()) if "completed" in result else True
+        solver_converged = solver_completed and bool(converged(problem, result["final"], tolerance)[0])
+        pgs_exhausted = (hybrid or model is None) and not solver_converged and solver_completed
+        solver_stats = dict(solver_completed=solver_completed, solver_converged=solver_converged,
+                            pgs_budget_exhausted=pgs_exhausted,
+                            projected_gradient=float(local_stats["projected_gradient"][0]),
+                            linear_penetration=float(local_stats["penetration"][0]))
+        if hybrid:
+            prefix_stats = residuals(problem, result["cfm_final"])
+            solver_stats.update(cfm_completed=bool(result["cfm_completed"][0]),
+                cfm_converged=bool(result["cfm_converged"][0]),
+                cfm_projected_gradient=float(prefix_stats["projected_gradient"][0]),
+                cfm_linear_penetration=float(prefix_stats["penetration"][0]))
+        attempt = dict(counters=counters, **solver_stats, dynamics_seconds=dynamics_seconds,
+                       setup_seconds=setup_seconds, solver_seconds=solver_seconds,
+                       attempt_seconds=dynamics_seconds+setup_seconds+solver_seconds)
         if "completed" in result and not bool(result["completed"].all()):
-            failure = dict(frame=frame+1, reason="incomplete_solver_clock", counters=counters,
-                           solver_tau=float(result["time"][0]), failure_code=int(result["failure_code"][0]),
-                           attempt_seconds=dynamics_seconds+setup_seconds+solver_seconds)
+            failure = dict(frame=frame+1, reason="incomplete_solver_clock", **attempt,
+                           solver_tau=float(result["time"][0]), failure_code=int(result["failure_code"][0]))
             break  # A partial map is NOT silently promoted to the next physical frame.
+        if pgs_exhausted:
+            failure = dict(frame=frame+1, reason="pgs_budget_exhausted", **attempt)
+            break
         def update():
             position = decode(problem, result["final"]).reshape(1, len(radius), 2)
             return finite_difference_state(state[None], position, dt)[0]
@@ -115,7 +162,6 @@ def simulate(initial, radius, config, device, model=None, calls=1, guarded=False
         phase = ("onset" if added.any() else "release" if released.any()
                  else "contact" if contacts.any() else "free_flight")
         oracle = pgs(problem, start, ref["qp_tolerance"], ref["max_sweeps"])
-        local_stats = residuals(problem, result["final"])
         fixed_gap = gap(problem, result["final"])[0, problem["mask"][0]]
         mass = math.pi * physics.density * radius.square()
         free_velocity = (proposal-state[:, :2])/dt
@@ -130,13 +176,11 @@ def simulate(initial, radius, config, device, model=None, calls=1, guarded=False
         row = dict(frame=frame+1, physical_time=(frame+1)*dt, phase=phase,
             frozen_contacts=int(near.sum()), active_contacts=int(contacts.sum()),
             contacts_added=int(added.sum()), contacts_released=int(released.sum()),
-            solver_converged=bool(converged(problem, result["final"], tolerance)[0]),
+            **solver_stats,
             oracle_converged=bool(oracle["converged"][0]),
             local_qp_position_mse=(float(position_error(problem, result["final"], oracle["final"])[0])
                                    if bool(oracle["converged"][0]) else None),
-            projected_gradient=float(local_stats["projected_gradient"][0]),
             negative_multiplier=float(local_stats["negative_multiplier"][0]),
-            linear_penetration=float(local_stats["penetration"][0]),
             geometric_penetration=float(after["max_violation"][0]),
             new_violations_outside_frozen_contacts=int(((actual_gap < -physics.slop-tolerance) & ~near).sum()),
             linearization_gap_error_max=float((actual_gap[near]+physics.slop-fixed_gap).abs().max()) if near.any() else 0.,
@@ -149,7 +193,7 @@ def simulate(initial, radius, config, device, model=None, calls=1, guarded=False
             dynamics_seconds=dynamics_seconds+update_seconds, setup_seconds=setup_seconds,
             solver_seconds=solver_seconds,
             simulation_seconds=dynamics_seconds+setup_seconds+solver_seconds+update_seconds, **counters)
-        if getattr(model, "head_type", "analytic") == "direct" and not guarded:
+        if getattr(model, "head_type", "analytic") == "direct" and not guarded and not hybrid:
             diagnostic = unclipped_summary(model, problem, start, calls, tolerance)
             diagnostic.pop("per_scene")  # This frame contains exactly one QP.
             diagnostic["scope"] = "Untimed same-frame frozen-QP counterfactual; not an unprojected physical rollout"
@@ -161,6 +205,9 @@ def simulate(initial, radius, config, device, model=None, calls=1, guarded=False
             failure = dict(frame=frame+1, reason="diagnostic_bound_exceeded_no_clipping")
             break
     return dict(states=torch.stack(states), frames=rows, requested_steps=steps,
+                solver_kind="hybrid" if hybrid else ("cfm" if model is not None else "pgs"),
+                fm_calls=calls if model is not None else 0,
+                projection_scope="FM stage only; PGS work is counted as contact_evals" if hybrid else "solver",
                 completed_steps=len(rows), failure=failure, summary=rollout_summary(rows))
 
 
@@ -173,9 +220,23 @@ def rollout_summary(rows):
             swept_endpoint_missed_pairs=sum(x["swept_endpoint_missed_pairs"] for x in items),
             contacts_added=sum(x["contacts_added"] for x in items),
             contacts_released=sum(x["contacts_released"] for x in items),
+            mean_solver_seconds=sum(x["solver_seconds"] for x in items)/max(count, 1),
+            mean_setup_seconds=sum(x["setup_seconds"] for x in items)/max(count, 1),
             mean_simulation_seconds=sum(x["simulation_seconds"] for x in items)/max(count, 1),
+            total_solver_seconds=sum(x["solver_seconds"] for x in items),
+            total_simulation_seconds=sum(x["simulation_seconds"] for x in items),
+            total_nfe=sum(x["nfe"] for x in items),
+            total_pgs_sweeps=sum(x["sweeps"] for x in items),
+            mean_pgs_sweeps=sum(x["sweeps"] for x in items)/max(count, 1),
+            max_pgs_sweeps=max((x["sweeps"] for x in items), default=0),
             max_speed=max((x["max_speed"] for x in items), default=0.),
             **aggregate_projection_rows(items))
+        hybrid_rows = [x for x in items if "cfm_converged" in x]
+        if hybrid_rows:
+            report["hybrid"] = dict(frames=len(hybrid_rows),
+                cfm_converged_steps=sum(x["cfm_converged"] for x in hybrid_rows),
+                pgs_recovered_steps=sum(x["solver_converged"] and not x["cfm_converged"] for x in hybrid_rows),
+                zero_pgs_sweep_steps=sum(x["sweeps"] == 0 for x in hybrid_rows))
         unclipped = [x["unclipped_diagnostic"] for x in items if "unclipped_diagnostic" in x]
         if unclipped:
             report["unclipped_diagnostic"] = dict(
@@ -194,7 +255,7 @@ def rollout_summary(rows):
     return report
 
 
-def render_motion(results, radius, physics, settings, path):
+def render_motion(results, radius, physics, settings, path, *, labels=None):
     """Common camera/time axis, finite traces only; stopped runs are labelled."""
     from PIL import Image, ImageDraw
     from data.box2d_render import render_state_image
@@ -208,30 +269,41 @@ def render_motion(results, radius, physics, settings, path):
     if min(size, stride) < 1:
         raise ValueError("Positive rendering size/stride required")
     height = max(180, min(round(size*(bounds[3]-bounds[2])/(bounds[1]-bounds[0])), round(size*1.25)))
+    header_height = 116
     frames = []
-    length = max(len(run["states"]) for run in results.values())
+    # Include a failed attempt even when every run stops before advancing.
+    length = max(max(len(run["states"]), run["failure"]["frame"]+1 if run["failure"] else 0)
+                 for run in results.values())
     indices = list(range(0, length, stride))
     if indices[-1] != length-1:
         indices.append(length-1)
     for k in indices:
-        canvas = Image.new("RGB", (size*len(results), height+78), "white")
+        canvas = Image.new("RGB", (size*len(results), height+header_height), "white")
         draw = ImageDraw.Draw(canvas)
         for column, (name, run) in enumerate(results.items()):
             index = min(k, len(run["states"])-1)
             panel = render_state_image(run["states"][index], radius, physics.xy_limit,
                 physics.y_ground, size, view_bounds=bounds, canvas_size=(size, height), show_centers=True)
-            canvas.paste(panel, (column*size, 78))
+            canvas.paste(panel, (column*size, header_height))
             stopped = run["failure"] and k >= run["failure"]["frame"]
-            draw.text((column*size+8, 6), name + ("  STOPPED" if stopped else ""), fill="red" if stopped else "black")
+            title = (labels or {}).get(name, name)
+            draw.text((column*size+8, 6), title + ("  STOPPED" if stopped else ""), fill="red" if stopped else "black")
             draw.text((column*size+8, 23), f"frame={k}  state_frame={index}", fill="black")
             if index:
                 row = run["frames"][index-1]
-                draw.text((column*size+8, 40), f"pen={row['geometric_penetration']:.4g}  {row['phase']}", fill="black")
+                status = "OK" if row["solver_converged"] else "MISS"
+                draw.text((column*size+8, 40), f"KKT={status}  pen={row['geometric_penetration']:.4g}", fill="black")
+                draw.text((column*size+8, 57), f"NFE={row['nfe']}  PGS sweeps={row['sweeps']}", fill="black")
+                draw.text((column*size+8, 74), f"solve={1000*row['solver_seconds']:.2f}ms  {row['phase']}", fill="black")
+            if stopped:
+                # Metrics above refer to the held last state; failure has its
+                # own attempt frame and costs in JSON.
+                draw.text((column*size+8, 91), run["failure"]["reason"], fill="red")
             p = run["states"][index, :, :2]
             outside = int(((p[:, 0] < bounds[0]) | (p[:, 0] > bounds[1]) |
                            (p[:, 1] < bounds[2]) | (p[:, 1] > bounds[3])).sum())
-            if outside:
-                draw.text((column*size+8, 57), f"OUT OF VIEW: {outside}", fill="red")
+            if outside and not stopped:
+                draw.text((column*size+8, 91), f"OUT OF VIEW: {outside}", fill="red")
         frames.append(canvas)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -242,6 +314,12 @@ def render_motion(results, radius, physics, settings, path):
 
 def evaluate_motion(models, config, device, output, metadata=None):
     settings = config["rollout"]
+    calls, hybrid_calls = rollout_budgets(settings)
+    hybrid_calls = hybrid_calls if models else []
+    # Every hybrid budget gets an independent raw-FM trajectory for its GIF.
+    neural_calls = list(dict.fromkeys(calls + hybrid_calls))
+    for model in models.values():
+        model.eval()
     physics = PhysicsConfig(**config["physics"])
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -252,25 +330,36 @@ def evaluate_motion(models, config, device, output, metadata=None):
     head_types = {name: getattr(model, "head_type", "analytic") for name, model in models.items()}
     formats = set(model_formats.values())
     solvers = set(descriptions.values())
-    report = dict(scope="Per-frame frozen contact diagnostic; fresh lambda=0; no finish/restitution/friction/CCD",
+    report = dict(scope="Per-frame frozen contact diagnostic; fresh lambda=0; explicit hybrid FM+PGS; no restitution/friction/CCD",
         model_format=next(iter(formats)) if len(formats) == 1 else ("mixed" if formats else None),
         model_formats=model_formats, head_types=head_types,
         solver=next(iter(solvers)) if len(solvers) == 1 else ("mixed" if solvers else None),
         solver_descriptions=descriptions,
         raw_definition="Analytic heads project their endpoint; direct heads project multipliers after Euler updates; no Q guard or finish",
         local_definition="Analytic local endpoint with zero neural coupling and the same tau schedule",
+        hybrid=dict(enabled=bool(hybrid_calls), calls=hybrid_calls,
+            tolerance=config["evaluation"]["tolerance"], max_pgs_sweeps=config["reference"]["max_sweeps"],
+            definition="Fresh complete raw FM [0,1], then PGS on the same frame QP and exact FM endpoint; no reference input",
+            failure_policy="Incomplete FM or capped PGS aborts the frame; last valid physical state is preserved",
+            comparison="Methods evolve their own trajectories; same initial scene/dt, not identical QPs across methods"),
+        standalone_neural_calls=neural_calls if models else [],
         timing_scope="Simulation includes free dynamics, geometry/D/eta setup, solve with neural features/projection, FD; excludes oracle/metrics/projection-counter reductions/unclipped counterfactual/rendering. Not a speed benchmark.",
         unclipped_scope="Raw direct methods only: same-frame frozen-QP counterfactuals; not separate physical trajectories or primary performance results",
         swept_scope="Straight previous-to-next position segments only, NOT internal solver trajectories",
-        device=str(device), config=config, metadata=metadata or {}, scenes={})
+        summary_scope="Completed physical frames only; a rejected attempt and its costs are stored in failure",
+        device=str(device), config=config, metadata=metadata or {}, scenes={}, render_files={})
     for name, initial, radius in motion_scenes(physics):
         results = {"pgs": simulate(initial, radius, config, device)}
         compared = dict(local=LocalProjection(), **models) if models else {}
         for objective, model in compared.items():
-            for calls in settings["calls"]:
-                results[f"{objective}_k{calls}_raw"] = simulate(initial, radius, config, device, model, calls)
+            for budget in (neural_calls if objective in models else calls):
+                results[f"{objective}_k{budget}_raw"] = simulate(initial, radius, config, device, model, budget)
                 if settings.get("guarded", False):
-                    results[f"{objective}_k{calls}_guarded"] = simulate(initial, radius, config, device, model, calls, True)
+                    results[f"{objective}_k{budget}_guarded"] = simulate(initial, radius, config, device, model, budget, True)
+            if objective in models:
+                for budget in hybrid_calls:
+                    results[f"{objective}_k{budget}_hybrid"] = simulate(
+                        initial, radius, config, device, model, budget, hybrid=True)
         for run in results.values():
             count = min(len(run["states"]), len(results["pgs"]["states"]))
             for k in range(1, count):
@@ -283,8 +372,23 @@ def evaluate_motion(models, config, device, output, metadata=None):
         report["scenes"][name] = {method: {key: value for key, value in run.items() if key != "states"}
                                  for method, run in results.items()}
         if settings["render"]:
-            render_motion(results, radius, physics, dict(settings, time_step=config["dynamics"]["time_step"]),
-                          output.parent / f"{name}.gif")
+            rendering = dict(settings, time_step=config["dynamics"]["time_step"])
+            files = []
+            if hybrid_calls:
+                for objective in models:
+                    for budget in hybrid_calls:
+                        raw, hybrid = f"{objective}_k{budget}_raw", f"{objective}_k{budget}_hybrid"
+                        path = output.parent / f"{name}_{objective}_k{budget}_hybrid.gif"
+                        render_motion({key: results[key] for key in ("pgs", raw, hybrid)},
+                            radius, physics, rendering, path,
+                            labels={"pgs": "PGS", raw: f"{objective.upper()} K={budget}",
+                                    hybrid: f"{objective.upper()} K={budget} + PGS"})
+                        files.append(path.name)
+            else:
+                path = output.parent / f"{name}.gif"
+                render_motion(results, radius, physics, rendering, path)
+                files.append(path.name)
+            report["render_files"][name] = files
         write_json(output, report)  # Preserve completed scenes if a later scene fails.
         print(f"Motion {name}: " + ", ".join(f"{key}={run['completed_steps']}/{settings['steps']}"
                                              for key, run in results.items()), flush=True)

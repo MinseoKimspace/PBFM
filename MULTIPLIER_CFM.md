@@ -183,8 +183,8 @@ python train_multiplier.py --config configs/multiplier_cfm_ablation.yaml --varia
 # D의 frozen-QP 평가. A/B/C도 같은 명령에서 variant만 바꾼다.
 python eval_multiplier.py --config configs/multiplier_cfm_ablation.yaml --variant D --split test --device cuda
 
-# 같은 물리 dt로 새 접촉을 구성하며 진행하는 physical rollout 평가.
-python eval_multiplier_rollout.py --config configs/multiplier_cfm_ablation.yaml --variant D --device cuda
+# PGS / raw FM / FM+PGS를 비교하는 physical rollout과 K별 3-panel GIF.
+python eval_multiplier_rollout.py --config configs/multiplier_cfm_ablation.yaml --variant D --checkpoint best_solver --device cuda --calls 4 8 16 --hybrid-calls 4 8 16
 
 # 이후 교란 학습의 추가 효과를 비교한다.
 python train_multiplier.py --config configs/multiplier_cfm_ablation.yaml --variant D_recovery --device cuda
@@ -297,8 +297,69 @@ PGS 갱신에서 제외하고 최종 성공으로 집계하지 않는다. PGS �
 포함되지 않는다. Geometry/정답 생성/최종 decode/보고용 통계는 기존처럼 측정 범위 밖이다.
 
 우선 `zero` 결과에서 **FM 비용을 포함해도 필요한 PGS 반복이 충분히 줄어드는지** 판정한다.
-`over/mixed`는 reference-derived 시작점 진단이다. 이번 hybrid는 고정 QP 평가이며
-physical rollout의 solver를 자동으로 교체하지 않는다.
+`over/mixed`는 reference-derived 시작점 진단이다. `evaluation.hybrid`는 고정 QP 평가에만
+적용된다. Physical rollout의 하이브리드는 아래의 `rollout.hybrid`로 독립적으로 설정한다.
+
+### 하이브리드 physical rollout과 GIF
+
+기존 통합 YAML의 `rollout.hybrid.enabled: true`, `calls: [4,8,16]`으로 활성화한다.
+기존 체크포인트를 그대로 사용하며 재훈련이나 endpoint-pair cache가 필요하지 않다.
+
+```bash
+# D best_solver: 각 K마다 PGS / raw FM / FM+PGS 세 화면을 나란히 저장.
+python eval_multiplier_rollout.py --config configs/multiplier_cfm_ablation.yaml --variant D --checkpoint best_solver --device cuda --calls 4 8 16 --hybrid-calls 4 8 16
+
+# K=4만 먼저 확인. 별도 출력 폴더로 기존 결과를 보존한다.
+python eval_multiplier_rollout.py --config configs/multiplier_cfm_ablation.yaml --variant D --checkpoint best_solver --device cuda --calls 4 --hybrid-calls 4 --output runs/multiplier_cfm_ablation/D/motion/hybrid_k4
+```
+
+- 기본 출력 폴더: `runs/multiplier_cfm_ablation/D/motion/best_solver_cfm_hybrid/`.
+- `rollout.json`: 방법별 궤적의 프레임 기록, 요약, 실패와 체크포인트 메타데이터.
+- `<scene>_cfm_k4_hybrid.gif` 등: **PGS | CFM K=4 | CFM K=4 + PGS**. K마다 3-panel GIF를 별도로 만든다.
+- 같은 이름의 `.png`: GIF 마지막 화면. `<scene>_trajectories.pt`: 모든 방법의 실제 state 궤적.
+- 장면은 `drop_floor`, `oblique_collision`, `impact_stack`, `collapse_stack`이다.
+- 기본 300 physical frames이며 `--steps`로 변경한다. GIF에는 수렴 여부, 침투량, NFE, PGS sweep, solver 시간이 표시된다.
+
+`--hybrid-calls`는 하이브리드를 활성화하고 FM 예산을 지정한다. 같은 K의 raw FM도 자동으로
+평가하여 GIF에 포함한다. `--calls`는 별도의 standalone FM/local 예산이며 두 옵션은 독립적이다.
+`--hybrid`는 YAML의 예산(없으면 4/8/16)으로 활성화하고, `--no-hybrid`는 기존 raw/guarded
+rollout과 `<scene>.gif` 출력으로 돌아간다. `--guarded`는 standalone 비교만 추가하며 하이브리드의
+FM은 항상 raw다. `--pgs-only`는 YAML의 하이브리드를 무시하며 체크포인트 없이 PGS만 실행한다.
+`--no-render`는 GIF/PNG를 생략하고 JSON/궤적을 저장한다. 기존 결과 폴더는 덮어쓰지 않으며
+재실행할 때 `--output`으로 새 폴더를 지정한다.
+
+매 프레임은 다음 순서로 진행한다.
+
+1. 현재 물리 상태로 free dynamics와 contact QP를 구성하고 lambda=0에서 시작한다.
+2. FM을 [0,1] 전체에서 K회 실행한다. 각 프레임마다 FM clock을 새로 시작한다.
+3. **동일 QP와 정확히 그 FM endpoint**에서 PGS를 실행한다. `evaluation.tolerance`와
+   `reference.max_sweeps`를 사용하며 PGS 단독과 조건이 같다.
+4. 최종 위치를 decode하고 유한 차분으로 속도를 복원해 물리 시간을 한 프레임 전진시킨다.
+
+FM 미완주나 PGS 반복 상한 미수렴은 `failure`에 기록하고 해당 프레임을 적용하지 않는다.
+PGS 단독도 반복 상한에서 미수렴이면 중단한다. Raw FM은 유한한 전체 map을 완주했으면
+허용 오차 미달을 기록하면서 진행한다. 중단된 GIF는 마지막 유효 상태를 유지하고 `STOPPED`를
+표시한다. JSON의 `frames`와 요약은 실제 진행한 프레임만 포함하며, 거부된 시도의 계산량과
+시간은 `failure`에 별도로 기록한다.
+
+주요 프레임 필드는 다음과 같다.
+
+| 필드 | 의미 |
+|---|---|
+| `solver_converged`, `projected_gradient` | 최종 frozen-QP KKT 수렴 여부와 잔차 |
+| `cfm_completed`, `cfm_converged`, `cfm_projected_gradient` | 하이브리드에서 PGS 이전 FM 상태 |
+| `nfe`, `sweeps`, `contact_evals` | FM 호출, PGS sweep, 유효 접촉 갱신 수; 서로 다른 계산 단위 |
+| `solver_seconds` | FM과 PGS 전달·마무리를 포함한 연속 solver 시간 |
+| `setup_seconds`, `dynamics_seconds`, `simulation_seconds` | QP 구성, free dynamics/속도 복원, 전체 simulation 시간 |
+| `linear_penetration`, `geometric_penetration` | 고정 선형 QP의 침투와 실제 갱신된 geometry의 침투 |
+| `pgs_budget_exhausted` | PGS 반복 상한 미수렴; 거부된 프레임은 `failure`에서 확인 |
+
+Oracle·통계·렌더링과 direct-head projection 진단은 측정 시간에 포함하지 않는다. 하이브리드의
+projection 진단은 FM endpoint에서 재실행해 확인하며 최종 PGS 상태와 혼동하지 않는다.
+
+각 방법은 같은 초기 장면과 dt에서 출발하지만 이후 자체 궤적으로 진행한다. 따라서 방법 간
+QP는 달라질 수 있다. 이 rollout은 접촉 변화와 물리 안정성 진단이며, 같은 QP에서 같은 정확도까지의
+가속률은 별도 `eval_multiplier.py` 벤치마크로 비교한다.
 
 ### 동일 반복 예산 평가
 

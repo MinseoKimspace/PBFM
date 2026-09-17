@@ -92,6 +92,9 @@ evaluation:
 rollout:
   steps: 300
   calls: [1, 2, 4]
+  hybrid:
+    enabled: true
+    calls: [4, 8, 16]        # Adds matching raw FM and three-panel GIFs per K.
   guarded: false
   max_backtracks: 8
   frame_stride: 3

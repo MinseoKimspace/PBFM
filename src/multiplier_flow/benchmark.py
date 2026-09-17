@@ -31,15 +31,15 @@ def validate_budgets(settings):
     return list(calls)
 
 
-def hybrid_budgets(settings):
+def hybrid_budgets(settings, *, scope="evaluation"):
     options = settings.get("hybrid", {})
     if not isinstance(options, dict) or type(options.get("enabled", False)) is not bool:
-        raise ValueError("evaluation.hybrid must be a mapping with boolean enabled")
+        raise ValueError(f"{scope}.hybrid must be a mapping with boolean enabled")
     calls = options.get("calls", [4, 8, 16])
     if (not isinstance(calls, (list, tuple)) or not calls
             or any(type(k) is not int or k < 1 for k in calls)
             or len(set(calls)) != len(calls)):
-        raise ValueError("evaluation.hybrid.calls must contain distinct positive integers")
+        raise ValueError(f"{scope}.hybrid.calls must contain distinct positive integers")
     return list(calls) if options.get("enabled", False) else []
 
 
