@@ -9,14 +9,15 @@ from time import perf_counter
 import torch
 
 from src.contact_flow.physics import PhysicsConfig
-from .benchmark import (accuracy_summary, budget_comparison, reference_errors,
+from .benchmark import (accuracy_summary, budget_comparison, hybrid_budgets,
+                        hybrid_comparison, hybrid_summary, reference_errors,
                         runtime_environment, timing_summary, validate_budgets,
                         work_summary, write_budget_table)
 from .data import release_problem
 from .model import CHECKPOINT_FORMAT, SOLVER_DESCRIPTION, ConditionalField, LocalProjection
 from .problem import (circle_problem, contact_endpoint, converged, decode, field, gap,
                       move, pack, position_error, relinearize, residuals, select)
-from .solvers import active_set_solution, pgs, run_cfm
+from .solvers import active_set_solution, pgs, run_cfm, run_hybrid
 
 
 def write_json(path, report):
@@ -92,6 +93,29 @@ def start_mode_description(mode):
     if mode == "zero":
         return "Primary solver evaluation: zero initialization, no reference endpoint input"
     return "Diagnostic only: initialization is constructed using the reference endpoint"
+
+
+def hybrid_stage_timings(model, problem, start, calls, tolerance, max_sweeps,
+                         device, repeats, expected):
+    """Separate instrumented replays; never replace the continuous total time."""
+    def replay():
+        return run_hybrid(model, problem, start, calls, tolerance, max_sweeps,
+                          stage_timer=lambda operation: timed(device, operation))
+
+    replay()  # Warm up the instrumented path as well.
+    samples = {"cfm": [], "pgs": []}
+    for _ in range(repeats):
+        result = replay()
+        for key in ("final", "cfm_final", "completed", "converged", "sweeps", "nfe"):
+            if not torch.equal(result[key], expected[key]):
+                raise RuntimeError("Stage-timing replay changed the hybrid result")
+        for stage in samples:
+            samples[stage].append(result["stage_seconds"][stage])
+    report = {stage: timing_summary(seconds, len(start)) for stage, seconds in samples.items()}
+    for stage in samples:
+        report[stage]["scope"] = f"{stage} stage in separate synchronized hybrid replays; not the primary total timing"
+    report["note"] = "Stage medians need not sum to continuous total: separate replays, intermediate synchronization and handoff overhead. PGS stage includes its stopping checks."
+    return report
 
 
 def aggregate_projection_rows(rows):
@@ -389,6 +413,7 @@ def preflight(config, output):
 def evaluate(model, split, config, device, output, metadata=None):
     ref, settings = config["reference"], config["evaluation"]
     budgets = validate_budgets(settings)
+    hybrid_calls = hybrid_budgets(settings)
     position_tolerance = float(settings.get("position_tolerance", settings["tolerance"]))
     model.eval()
     contexts = scene_indices(split["names"], int(settings["max_scenes"]))
@@ -426,12 +451,20 @@ def evaluate(model, split, config, device, output, metadata=None):
                       objective_gap="Signed Q(prediction)-Q(reference), recomputed on original float64 QP",
                       multiplier_error="Diagnostic only; redundant constraints can make multipliers nonunique"),
                   fixed_budget_comparison={},
+                  hybrid=dict(calls=hybrid_calls, tolerance=settings["tolerance"],
+                      max_pgs_sweeps=ref["max_sweeps"],
+                      definition="Complete raw FM clock, then tolerance-stopped PGS on the same QP and exact FM endpoint; no reference input or fallback",
+                      timing="Primary: fresh continuous FM+handoff+PGS. Stage times: separate synchronized replays.",
+                      batch_policy="Same dense padded PGS implementation as baseline; solved rows get zero updates, no batch compaction",
+                      failures="Incomplete FM clocks are excluded from PGS and remain failed; PGS cap misses are explicit"),
+                  hybrid_comparison={},
                   float64_label_quality=summarize(problem64, optimum64, optimum64, settings["tolerance"]))
     for mode in settings["start_modes"]:
         start = evaluation_start(problem, optimum, mode)
         rows = {}
         raw_budgets = {}
         diagnostic_specs = {}
+        hybrid_specs = {}
         operations = {"pgs": lambda: pgs(problem, start, settings["tolerance"], ref["max_sweeps"])}
         for calls in budgets:
             operations[f"pgs_k{calls}_fixed"] = lambda k=calls: pgs(
@@ -449,6 +482,11 @@ def evaluate(model, split, config, device, output, metadata=None):
                     diagnostic_specs[name] = (calls, guarded)
                 if direct and not guarded:
                     raw_budgets[name] = calls
+        for calls in hybrid_calls:
+            name = f"hybrid_k{calls}_pgs"
+            hybrid_specs[name] = calls
+            operations[name] = lambda k=calls: run_hybrid(
+                model, problem, start, k, settings["tolerance"], ref["max_sweeps"])
         for name, operation in operations.items():
             operation()
             measurements = [timed(device, operation) for _ in range(settings["timing_repeats"])]
@@ -457,12 +495,24 @@ def evaluate(model, split, config, device, output, metadata=None):
                 calls, guarded = diagnostic_specs[name]
                 collect_projection_diagnostics(model, problem, start, calls, result,
                                                guarded, settings["max_backtracks"])
+            if name in hybrid_specs and direct:
+                prefix_result = dict(final=result["cfm_final"], completed=result["cfm_completed"])
+                collect_projection_diagnostics(model, problem, start, hybrid_specs[name], prefix_result)
+                result.update({key: values for key, values in prefix_result.items()
+                               if key not in ("final", "completed")})
             row = summarize(problem, result["final"], optimum, settings["tolerance"])
             row["seconds"] = sum(item[1] for item in measurements) / len(measurements)
             row["timing_repeats"] = len(measurements)
             row["timing"] = timing_summary([item[1] for item in measurements], count)
-            row["cost"] = work_summary(result, problem, model if name.startswith("cfm_") else None)
+            row["cost"] = work_summary(result, problem, model if name.startswith(("cfm_", "hybrid_")) else None)
             errors = reference_errors(problem64, result["final"], optimum64, model.length_scale)
+            if name in hybrid_specs:
+                prefix_stats = residuals(problem, result["cfm_final"])
+                prefix_errors = reference_errors(problem64, result["cfm_final"], optimum64, model.length_scale)
+                row["timing"]["stage_diagnostics"] = hybrid_stage_timings(
+                    model, problem, start, hybrid_specs[name], settings["tolerance"],
+                    ref["max_sweeps"], device, settings["timing_repeats"], result)
+                row["projection_scope"] = "FM stage only; PGS projection work is counted as contact_evals"
             completed = result.get("completed", torch.ones(count, dtype=torch.bool, device=device))
             row["converged_count"] = row["success_count"]
             row["success_count"] = int((completed & converged(problem, result["final"], settings["tolerance"])).sum())
@@ -483,12 +533,21 @@ def evaluate(model, split, config, device, output, metadata=None):
                         scene[key] = result[key][i].item()
                 scene.update(projection_summary(result, i))
                 scene.update({key: float(values[i]) for key, values in errors.items()})
+                if name in hybrid_specs:
+                    scene.update({key: bool(result[key][i]) for key in
+                                  ("cfm_completed", "cfm_converged", "pgs_budget_exhausted")})
+                    scene.update(cfm_projected_gradient=float(prefix_stats["projected_gradient"][i]),
+                                 cfm_position_rmse=float(prefix_errors["position_rmse"][i]))
                 row["per_scene"].append(scene)
             row["accuracy"] = accuracy_summary(row["per_scene"], position_tolerance)
+            if name in hybrid_specs:
+                row["hybrid"] = hybrid_summary(row["per_scene"])
             row["groups"] = group_summary(row["per_scene"])
             for group, stats in row["groups"].items():
                 members = [scene for scene in row["per_scene"] if scene["name"].rsplit("_", 1)[0] == group]
                 stats["accuracy"] = accuracy_summary(members, position_tolerance)
+                if name in hybrid_specs:
+                    stats["hybrid"] = hybrid_summary(members)
             if name in raw_budgets:
                 diagnostic = unclipped_summary(model, problem, start, raw_budgets[name],
                                                settings["tolerance"], optimum)
@@ -501,6 +560,7 @@ def evaluate(model, split, config, device, output, metadata=None):
                             split["radii"][int(contexts[0])], config, Path(output).parent / "renders" / f"{name}.png", name)
         report["modes"][mode] = rows
         report["fixed_budget_comparison"][mode] = budget_comparison(rows, budgets)
+        report["hybrid_comparison"][mode] = hybrid_comparison(rows, hybrid_calls)
     if settings.get("recovery", {}).get("enabled", False):
         from .recovery import recovery_evaluation
         report["recovery"] = recovery_evaluation(model, split, config, device)

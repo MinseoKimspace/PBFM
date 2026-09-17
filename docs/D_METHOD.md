@@ -157,6 +157,12 @@ K=16은 K=4 결과에 12번을 추가하는 것이 아니라 [0,1] 전체를 다
 - D K회와 PGS K sweep의 차이: 반복 예산당 오차 감소의 비교.
 - 같은 정확도에서의 실행 시간: 실제 solver 가속의 비교.
 
+추가된 hybrid 평가는 **D의 raw FM 적분을 완전히 끝낸 후**, 그 multiplier를 그대로
+PGS의 초기값으로 사용한다. 같은 QP와 동일 tolerance에서 PGS를 마무리하며,
+기존 D 모델/학습과는 별도의 추론 조합이다. `evaluation.hybrid.calls: [4,8,16]`을 사용한다.
+PGS 단독 대비 가속은 FM부터 PGS까지의 전체 시간으로 판정한다. FM이 실패한 경우는
+PGS로 숨기지 않고 실패로 기록하며, 이미 수렴한 endpoint는 추가 갱신을 하지 않는다.
+
 현재 best_solver checkpoint는 validation source/장면 유형과 K={1,2,4}를 균등하게 반영해
 선택한다. 평가 K를 확장해도 그 checkpoint 선택 기준까지 자동으로 바뀌지는 않는다.
 K=16 중심 선택을 연구하려면 test가 아닌 validation에서 선택 기준을 따로 정해야 한다.

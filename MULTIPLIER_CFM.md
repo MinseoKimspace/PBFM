@@ -235,6 +235,71 @@ Profile은 고정 tau와 초기 가중치에서의 측정이며 전체 학습의
 
 ## 7. 평가와 해석
 
+### FM + PGS 하이브리드 평가
+
+기존 D checkpoint를 그대로 사용해 아래 조합을 비교한다. 학습 objective나 checkpoint는
+변경하지 않고 추론 절차를 명시적으로 추가한 것이다.
+
+```text
+같은 초기값 → FM K회로 tau=1까지 실행 → FM의 최종 multiplier로 PGS 시작
+                                      → 같은 QP에서 tolerance까지 마무리
+```
+
+통합 YAML의 `evaluation.hybrid.enabled: true`, `calls: [4,8,16]`이 기본값이다.
+PGS 단독과 hybrid의 tolerance는 모두 `evaluation.tolerance`, 최대 sweep은 모두
+`reference.max_sweeps`를 사용한다. FM 자체는 raw Euler이며 중간 guard나 정답 입력이 없다.
+이미 허용 오차를 만족한 FM endpoint는 PGS 갱신을 0회 수행한다. 그 판정 비용은 시간에 포함된다.
+PGS는 기준선과 같은 dense 배치 구현을 사용하며, 완료한 행을 압축해 제거하지 않는다.
+
+```powershell
+# 기존 checkpoint로 FM 4/8/16회 + PGS 마무리, PGS 단독, 고정 예산 평가를 함께 실행.
+python eval_multiplier.py --config configs/multiplier_cfm_ablation.yaml --variant D --checkpoint best_solver --device cuda --no-render
+
+# 고정 예산 평가 범위도 4/8/16으로 줄이고 hybrid를 명시적으로 활성화.
+python eval_multiplier.py --config configs/multiplier_cfm_ablation.yaml --variant D --calls 4 8 16 --hybrid-calls 4 8 16 --device cuda --no-render
+```
+
+출력은 `runs/multiplier_cfm_ablation/D/cfm/eval_test_best_solver_hybrid.json`과 같은 이름의
+`.md` 표다. 이전 `_budget.json` 결과는 덮어쓰지 않는다. 재평가 결과를 다른 이름으로
+보존하려면 `--output reports/hybrid_run2.json`을 지정한다. `--no-hybrid`는 하이브리드를 끈다.
+Hybrid 설정이 없는 기존 YAML에서도 `--hybrid`로 기본 예산 4/8/16을 활성화할 수 있다.
+`--hybrid-calls`는 `--calls`와 독립적으로 FM 예산을 지정하며 hybrid를 활성화한다.
+
+각 `modes.<start>.hybrid_k<K>_pgs` 결과는 기존 오차/정확도에 다음을 추가한다.
+
+| 필드 | 의미 |
+|---|---|
+| `hybrid.cfm_success_count` | PGS를 적용하기 전 FM endpoint의 KKT 성공 수 |
+| `hybrid.final_success_count` | PGS 마무리 후 최종 성공 수 |
+| `hybrid.recovered_count` | FM에서 미수렴이었다가 PGS로 해결된 문제 수 |
+| `hybrid.pgs_sweeps_per_qp` | 추가 PGS sweep 평균·중앙값·p95·최대값; 0회인 문제도 포함 |
+| `hybrid.pgs_sweeps_when_used` | 실제 추가 갱신이 필요했던 문제들만의 sweep 분포 |
+| `hybrid.zero_pgs_sweep_count` | FM을 완주했고 추가 PGS 갱신이 필요 없었던 문제 수 |
+| `hybrid.cfm_failure_count` | 유효한 FM 시간 적분을 끝내지 못한 문제 수 |
+| `hybrid.pgs_budget_exhausted_count` | FM은 완주했지만 PGS 상한까지도 수렴하지 못한 문제 수 |
+| `timing` | 매번 FM부터 PGS까지 새로 실행한 연속 전체 시간 |
+| `timing.stage_diagnostics` | 별도 재실행에서 각각 측정한 FM/PGS 단계 시간; 전체 시간과 분리 |
+| `cost` | FM NFE와 추가 PGS sweep·접촉 갱신을 각각 기록; 서로 더해 단일 NFE로 만들지 않음 |
+
+장면별 `per_scene`와 그룹별 `groups`에도 FM 상태와 추가 sweep 통계를 남긴다.
+직접 velocity head를 평가할 때 projection 통계는 FM 단계에만 해당하며, PGS의 갱신량은
+`contact_evals`로 구분한다. FM 미완료 상태를 PGS로 몰래 복구하지 않는다. 실패한 행은
+PGS 갱신에서 제외하고 최종 성공으로 집계하지 않는다. PGS 상한에 도달한 미수렴도 숨기지 않는다.
+
+`hybrid_comparison.<start>.<K>`는 PGS 단독에 비해 줄거나 늘어난 sweep 수와 전체 시간 비율을
+기록한다. `speedup_at_full_success`는 두 방법이 모두 모든 QP를 같은 KKT tolerance로 풀었을 때만
+숫자를 갖고, 아니면 null이다. 기준해 위치 오차는 별개로 함께 확인해야 한다.
+
+전체 시간은 캐시해 둔 FM 결과를 재사용하지 않고 **FM 계산 + 전달/수렴 검사 + PGS 마무리**를
+한 번에 측정한다. 단계별 시간은 별도 동기화 재실행에서 수집하고, 결과 및 sweep 수가 원래 연속
+실행과 정확히 같은지 검사한다. 단계별 중앙값의 합을 전체 시간으로 대체하지 않는다.
+단계별 기록을 위한 추가 재실행은 벤치마크 자체의 실행 시간을 늘리지만 보고하는 주 solver 시간에는
+포함되지 않는다. Geometry/정답 생성/최종 decode/보고용 통계는 기존처럼 측정 범위 밖이다.
+
+우선 `zero` 결과에서 **FM 비용을 포함해도 필요한 PGS 반복이 충분히 줄어드는지** 판정한다.
+`over/mixed`는 reference-derived 시작점 진단이다. 이번 hybrid는 고정 QP 평가이며
+physical rollout의 solver를 자동으로 교체하지 않는다.
+
 ### 동일 반복 예산 평가
 
 `evaluation.calls: [1, 2, 4, 8, 16, 32, 64]`의 각 K에서 같은 고정 QP와
@@ -252,13 +317,13 @@ NFE=K이며, 선택적 guarded 결과는 동일 예산 표에 포함하지 않�
 
 ```powershell
 # 기존 D checkpoint와 공통 cache로 재평가한다. 재학습은 필요 없다.
-python eval_multiplier.py --config configs/multiplier_cfm_ablation.yaml --variant D --checkpoint best_solver --device cuda --no-render
+python eval_multiplier.py --config configs/multiplier_cfm_ablation.yaml --variant D --checkpoint best_solver --device cuda --no-render --no-hybrid
 
 # 평가 예산/반복 측정 횟수만 명시적으로 바꿀 수도 있다.
-python eval_multiplier.py --config configs/multiplier_cfm_ablation.yaml --variant D --calls 4 8 16 32 64 --timing-repeats 10 --no-render --device cuda
+python eval_multiplier.py --config configs/multiplier_cfm_ablation.yaml --variant D --calls 4 8 16 32 64 --timing-repeats 10 --no-render --device cuda --no-hybrid
 ```
 
-기본 출력은 `runs/multiplier_cfm_ablation/D/cfm/eval_test_best_solver_budget.json`과
+`--no-hybrid` 평가의 기본 출력은 `runs/multiplier_cfm_ablation/D/cfm/eval_test_best_solver_budget.json`과
 같은 이름의 `.md` 요약 표다. 기존 `eval_test_best_solver.json`은 덮어쓰지 않는다.
 이미 생성한 budget 결과도 보존하려면 `--output reports/another_budget.json`을 사용한다.
 데이터나 모델 설정이 checkpoint와 같아야 한다. 학습/선택 규칙은 이번 평가 변경으로 바뀌지 않는다.

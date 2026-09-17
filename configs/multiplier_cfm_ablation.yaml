@@ -77,6 +77,10 @@ evaluation:
   timing_repeats: 5           # One warmup, then synchronized solver batch timings.
   render: true
   image_size: 900
+  hybrid:
+    enabled: true
+    calls: [4, 8, 16]        # Complete FM, then PGS to evaluation.tolerance.
+                            # Same reference.max_sweeps cap as PGS-only baseline.
   recovery:
     enabled: true
     max_scenes: 16

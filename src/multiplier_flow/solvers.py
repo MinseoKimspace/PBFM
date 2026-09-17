@@ -79,16 +79,23 @@ def integrate_cfm(model, problem, start, calls, *, start_step=0, end_step=None,
 
 
 @torch.no_grad()
-def pgs(problem, start, tolerance=1e-7, max_sweeps=10000, *, stop_at_tolerance=True):
+def pgs(problem, start, tolerance=1e-7, max_sweeps=10000, *, stop_at_tolerance=True,
+        eligible=None):
     """Projected coordinate descent; one sweep visits every contact in order.
 
     Reference solves stop each world at tolerance (the historical default).
     Fixed-budget comparisons set stop_at_tolerance=False: exactly max_sweeps
     full sweeps, including worlds already solved. No hidden finishing solve.
     Padding is visited by the dense implementation but is not a contact update.
+    eligible can exclude failed FM prefixes from a hybrid finish. Excluded rows
+    remain unchanged and do not count as converged, even if their last valid
+    state happens to satisfy tolerance. No batch compaction is performed.
     """
     if tolerance <= 0 or type(max_sweeps) is not int or max_sweeps < 1:
         raise ValueError("Positive tolerance and sweep budget required")
+    if eligible is not None and (eligible.shape != (len(start),)
+            or eligible.dtype != torch.bool or eligible.device != start.device):
+        raise ValueError("eligible must be a per-world boolean tensor on the solver device")
     lam = start.clone()
     diagonal = problem["D"].diagonal(dim1=1, dim2=2).clamp_min(1e-30)
     sweeps = torch.zeros(len(lam), dtype=torch.long, device=lam.device)
@@ -96,10 +103,14 @@ def pgs(problem, start, tolerance=1e-7, max_sweeps=10000, *, stop_at_tolerance=T
     for _ in range(max_sweeps):
         if stop_at_tolerance:
             active = ~converged(problem, lam, tolerance)
+            if eligible is not None:
+                active &= eligible
             if not active.any():
                 break
         else:
             active = torch.ones(len(lam), dtype=torch.bool, device=lam.device)
+            if eligible is not None:
+                active &= eligible
         g = gap(problem, lam)
         for i in range(lam.shape[1]):
             enabled = active & problem["mask"][:, i]
@@ -108,8 +119,10 @@ def pgs(problem, start, tolerance=1e-7, max_sweeps=10000, *, stop_at_tolerance=T
             g += problem["D"][:, :, i] * increment[:, None]
             updates += enabled.long()
         sweeps += active.long()
-    return dict(final=lam, sweeps=sweeps, contact_evals=updates,
-                converged=converged(problem, lam, tolerance))
+    solved = converged(problem, lam, tolerance)
+    if eligible is not None:
+        solved &= eligible
+    return dict(final=lam, sweeps=sweeps, contact_evals=updates, converged=solved)
 
 
 @torch.no_grad()
@@ -238,3 +251,41 @@ def run_cfm(model, problem, start, calls, guarded=False, max_backtracks=12, *,
                 clipped_entries=clipped_entries, projection_steps=projection_steps,
                 projection_l1=projection_l1, projection_max=projection_max,
                 min_unprojected_multiplier=torch.where(torch.isfinite(minimum_raw), minimum_raw, 0))
+
+
+@torch.no_grad()
+def run_hybrid(model, problem, start, calls, tolerance=1e-3, max_sweeps=10000, *,
+               stage_timer=None):
+    """Complete raw FM on [0,1], then tolerance-stopped PGS on the SAME QP.
+
+    The PGS initial state is exactly the FM endpoint, without relinearization or
+    a reference input. Its sweep cap/tolerance should match the PGS-only baseline.
+    Failed FM clocks are excluded from PGS and remain failed; there is no fallback.
+    ``completed`` means a valid complete FM clock, not PGS convergence. A capped
+    unfinished solve is explicit in ``pgs_budget_exhausted`` and ``converged``.
+
+    Primary timings wrap this entire function. An optional timer(operation)
+    returning (result, seconds) is for a separate stage-timing replay only;
+    synchronization between stages must not change the primary measurement.
+    """
+    stage_seconds = {}
+
+    def execute(name, operation):
+        if stage_timer is None:
+            return operation()
+        result, seconds = stage_timer(operation)
+        stage_seconds[name] = seconds
+        return result
+
+    prefix = execute("cfm", lambda: run_cfm(
+        model, problem, start, calls, collect_diagnostics=False))
+    finish = execute("pgs", lambda: pgs(problem, prefix["final"], tolerance, max_sweeps,
+                                        eligible=prefix["completed"]))
+    result = dict(prefix)
+    result.update(final=finish["final"], sweeps=finish["sweeps"],
+                  contact_evals=finish["contact_evals"], converged=finish["converged"],
+                  cfm_final=prefix["final"], cfm_completed=prefix["completed"],
+                  cfm_converged=finish["converged"] & (finish["sweeps"] == 0),
+                  pgs_budget_exhausted=prefix["completed"] & ~finish["converged"],
+                  stage_seconds=stage_seconds)
+    return result

@@ -6,7 +6,7 @@ import torch
 
 from src.contact_flow.io import device, load_config
 from src.multiplier_flow.data import prepare
-from src.multiplier_flow.benchmark import validate_budgets
+from src.multiplier_flow.benchmark import hybrid_budgets, validate_budgets
 from src.multiplier_flow.evaluation import evaluate, preflight
 from src.multiplier_flow.experiment import VARIANTS, pair_cache_path, resolve_experiment
 from src.multiplier_flow.model import load_model
@@ -21,6 +21,10 @@ def main():
     parser.add_argument("--outdir")
     parser.add_argument("--variant", choices=VARIANTS)
     parser.add_argument("--calls", type=int, nargs="+", help="CFM NFE and matching fixed PGS sweep budgets")
+    hybrid_flags = parser.add_mutually_exclusive_group()
+    hybrid_flags.add_argument("--hybrid", action="store_true", help="Include FM + PGS to tolerance (default FM budgets 4 8 16)")
+    hybrid_flags.add_argument("--no-hybrid", action="store_true", help="Run the fixed-budget comparison without hybrid solves")
+    parser.add_argument("--hybrid-calls", type=int, nargs="+", help="Enable hybrid comparison with these FM budgets")
     parser.add_argument("--timing-repeats", type=int, help="Timed repetitions after one warmup per solver")
     parser.add_argument("--no-render", action="store_true")
     parser.add_argument("--output", help="Evaluation JSON path; also writes a Markdown comparison")
@@ -34,6 +38,13 @@ def main():
         config["evaluation"]["timing_repeats"] = args.timing_repeats
     if args.no_render:
         config["evaluation"]["render"] = False
+    if args.no_hybrid and args.hybrid_calls is not None:
+        parser.error("--no-hybrid cannot be combined with --hybrid-calls")
+    if args.hybrid or args.no_hybrid or args.hybrid_calls is not None:
+        options = config["evaluation"].setdefault("hybrid", {})
+        options["enabled"] = not args.no_hybrid
+        if args.hybrid_calls is not None:
+            options["calls"] = args.hybrid_calls
     validate_budgets(config["evaluation"])
     if args.output and Path(args.output).suffix.lower() != ".json":
         parser.error("--output must be a .json path; the .md companion is generated automatically")
@@ -54,7 +65,8 @@ def main():
     if cache["spec"] != checkpoint["cache_spec"]:
         raise ValueError("Checkpoint and CFM pair cache differ")
     suffix = "_guarded" if config["evaluation"].get("guarded", False) else ""
-    output = Path(args.output) if args.output else root / "cfm" / f"eval_{args.split}_{args.checkpoint}_budget{suffix}.json"
+    label = "hybrid" if hybrid_budgets(config["evaluation"]) else "budget"
+    output = Path(args.output) if args.output else root / "cfm" / f"eval_{args.split}_{args.checkpoint}_{label}{suffix}.json"
     evaluate(model, cache["splits"][args.split], config, selected_device, output,
              metadata=dict(checkpoint=str(path), objective="cfm", epoch=checkpoint["epoch"],
                            checkpoint_format=checkpoint["format"], solver=checkpoint["solver"],

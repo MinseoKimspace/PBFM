@@ -27,7 +27,20 @@ def validate_budgets(settings):
             raise ValueError(f"evaluation.{key} must be finite and positive")
     if type(settings["timing_repeats"]) is not int or settings["timing_repeats"] < 1:
         raise ValueError("evaluation.timing_repeats must be a positive integer")
+    hybrid_budgets(settings)
     return list(calls)
+
+
+def hybrid_budgets(settings):
+    options = settings.get("hybrid", {})
+    if not isinstance(options, dict) or type(options.get("enabled", False)) is not bool:
+        raise ValueError("evaluation.hybrid must be a mapping with boolean enabled")
+    calls = options.get("calls", [4, 8, 16])
+    if (not isinstance(calls, (list, tuple)) or not calls
+            or any(type(k) is not int or k < 1 for k in calls)
+            or len(set(calls)) != len(calls)):
+        raise ValueError("evaluation.hybrid.calls must contain distinct positive integers")
+    return list(calls) if options.get("enabled", False) else []
 
 
 def distribution(values):
@@ -99,6 +112,8 @@ def work_summary(result, problem, model=None):
     attention_heads = sum(layer.heads for layer in attention)
     return dict(logical_totals=totals,
                 logical_mean_per_qp={key: total / batch for key, total in totals.items()},
+                pgs_sweeps_per_qp=distribution(result["sweeps"]) if "sweeps" in result else None,
+                pgs_contact_updates_per_qp=distribution(result["contact_evals"]) if "contact_evals" in result else None,
                 valid_contacts=distribution(counts), padded_contacts=padded_contacts,
                 executed_batch_field_calls=field_calls,
                 executed_batch_neural_calls=neural_calls,
@@ -141,6 +156,48 @@ def budget_comparison(methods, budgets):
     return comparison
 
 
+def hybrid_summary(rows):
+    """PGS work after the FM endpoint; never report NFE+sweeps as one unit."""
+    sweeps = [row["sweeps"] for row in rows]
+    finished = sum(row["success_count"] for row in rows)
+    return dict(samples=len(rows),
+                cfm_completed_count=sum(row["cfm_completed"] for row in rows),
+                cfm_success_count=sum(row["cfm_converged"] for row in rows),
+                final_success_count=finished,
+                recovered_count=sum(row["success_count"] and not row["cfm_converged"] for row in rows),
+                cfm_failure_count=sum(not row["cfm_completed"] for row in rows),
+                pgs_budget_exhausted_count=sum(row["pgs_budget_exhausted"] for row in rows),
+                zero_pgs_sweep_count=sum(row["cfm_completed"] and row["sweeps"] == 0 for row in rows),
+                pgs_sweeps_per_qp=distribution(sweeps),
+                pgs_sweeps_when_used=distribution([count for count in sweeps if count > 0]),
+                cfm_projected_gradient=distribution([row["cfm_projected_gradient"] for row in rows]),
+                cfm_position_rmse=distribution([row["cfm_position_rmse"] for row in rows]))
+
+
+def hybrid_comparison(methods, budgets):
+    baseline = methods["pgs"]
+    comparisons = {}
+    for calls in budgets:
+        hybrid = methods[f"hybrid_k{calls}_pgs"]
+        a, b = hybrid["per_scene"], baseline["per_scene"]
+        if len(a) != len(b) or any(x["name"] != y["name"] for x, y in zip(a, b)):
+            raise ValueError("Hybrid and PGS must use identical ordered scenes")
+        both_solve_all = hybrid["success_count"] == baseline["success_count"] == len(a)
+        ratio = baseline["timing"]["median_seconds"] / hybrid["timing"]["median_seconds"]
+        comparisons[str(calls)] = dict(
+            hybrid_method=f"hybrid_k{calls}_pgs", baseline_method="pgs",
+            both_solve_all=both_solve_all,
+            pgs_over_hybrid_time_ratio=ratio,
+            speedup_at_full_success=ratio if both_solve_all else None,
+            hybrid_only_success=sum(bool(x["success_count"]) and not y["success_count"] for x, y in zip(a, b)),
+            pgs_only_success=sum(bool(y["success_count"]) and not x["success_count"] for x, y in zip(a, b)),
+            pgs_sweeps_saved_per_qp=distribution([y["sweeps"] - x["sweeps"] for x, y in zip(a, b)]),
+            fewer_pgs_sweeps_count=sum(x["sweeps"] < y["sweeps"] for x, y in zip(a, b)),
+            more_pgs_sweeps_count=sum(x["sweeps"] > y["sweeps"] for x, y in zip(a, b)),
+            note="Time includes fresh FM, handoff/checks and PGS finish. Full-success speedup requires both methods to solve every QP at the same KKT tolerance; position errors remain separate.")
+    return comparisons
+
+
 def write_budget_table(report, output):
     """Human-readable companion to the detailed JSON; one row per method/K."""
     lines = ["# Fixed-budget solver comparison", "",
@@ -170,6 +227,37 @@ def write_budget_table(report, output):
                          f"{1000 * timing['median_seconds']:.3f} | "
                          f"{1e6 * timing['amortized_median_seconds_per_qp']:.3f} |")
         lines.extend(["", f"Position tolerance: {methods['pgs']['accuracy']['position_tolerance']:g}.", ""])
+        if report.get("hybrid", {}).get("calls"):
+            append_hybrid_table(lines, report, mode, methods)
     path = Path(output)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def append_hybrid_table(lines, report, mode, methods):
+    lines.extend(["### FM + PGS to tolerance", "",
+        "Each hybrid executes fresh FM over [0,1], then PGS on the same QP. PGS uses the baseline tolerance and sweep cap.",
+        "Total ms is measured as one continuous solve, not a sum of independently measured medians.",
+        "Stage times come from separate synchronized replays. Speedup is shown only if both methods solve every QP.", "",
+        "| Method | FM solved % | Final solved % | Position RMSE mean | Position within tolerance % | PGS sweeps mean / p95 / max | FM stage ms | PGS stage ms | Total batch ms | Speedup vs PGS | FM failed / PGS cap misses |",
+        "|---|---|---|---|---|---|---|---|---|---|---|"])
+    baseline = methods["pgs"]
+    a = baseline["accuracy"]
+    work = baseline["cost"]["pgs_sweeps_per_qp"]
+    lines.append(f"| pgs | n/a | {100*a['success_rate']:.2f} | {a['position_rmse']['mean']:.6g} | "
+                 f"{100*a['position_within_tolerance_rate']:.2f} | {work['mean']:.2f} / {work['p95']:.2f} / {work['max']:.0f} | "
+                 f"n/a | n/a | {1000*baseline['timing']['median_seconds']:.3f} | 1.00 | n/a |")
+    for calls in report["hybrid"]["calls"]:
+        row = methods[f"hybrid_k{calls}_pgs"]
+        a, h, stages = row["accuracy"], row["hybrid"], row["timing"]["stage_diagnostics"]
+        work = h["pgs_sweeps_per_qp"]
+        speedup = report["hybrid_comparison"][mode][str(calls)]["speedup_at_full_success"]
+        speedup_text = "n/a" if speedup is None else f"{speedup:.3f}x"
+        lines.append(f"| hybrid_k{calls}_pgs | {100*h['cfm_success_count']/h['samples']:.2f} | "
+                     f"{100*a['success_rate']:.2f} | {a['position_rmse']['mean']:.6g} | "
+                     f"{100*a['position_within_tolerance_rate']:.2f} | "
+                     f"{work['mean']:.2f} / {work['p95']:.2f} / {work['max']:.0f} | "
+                     f"{1000*stages['cfm']['median_seconds']:.3f} | {1000*stages['pgs']['median_seconds']:.3f} | "
+                     f"{1000*row['timing']['median_seconds']:.3f} | {speedup_text} | "
+                     f"{h['cfm_failure_count']} / {h['pgs_budget_exhausted_count']} |")
+    lines.append("")
