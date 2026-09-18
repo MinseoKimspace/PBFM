@@ -447,6 +447,9 @@ Inner rollout의 K번 호출은 하나의 고정 QP 안에서 이루어지며 �
 
 ## 8. 코드와 검증
 
+별도의 조건부 해 분포 학습은 [DISTRIBUTION_EXPERIMENT.md](DISTRIBUTION_EXPERIMENT.md)를 참고한다.
+같은 통합 YAML을 사용하며, D 구조로 중복 접촉의 여러 정확한 multiplier 배분을 학습한다.
+
 - `src/multiplier_flow/problem.py`: 고정 QP, analytic endpoint, 위치 복원, KKT 잔차.
 - `model.py`: 국소/전역 통신, 접촉 head, CFM loss와 checkpoint 검사.
 - `solvers.py`: 학습·평가의 공통 Euler step, PGS, 선택적인 Q guard.
