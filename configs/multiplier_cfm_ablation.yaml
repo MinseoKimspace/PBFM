@@ -103,36 +103,23 @@ rollout:
   max_speed: 100.0
   max_position: 100.0
 
-# Separate synthetic experiment; does not change the original D pair cache or
-# training objective. Use train/eval_multiplier_distribution.py.
-distribution:
-  target: uniform_simplex    # D_distribution_point selects the exact barycenter.
-  source_scale: 1.0          # Uniform(0, source_scale * length_scale / D_ii).
-  data:
-    base_contacts: [2, 4, 8]
-    duplicates: [2, 3]
-    train_per_setting: 128
-    val_per_setting: 4
-    test_per_setting: 8
-    inverse_mass_range: [0.5, 2.0]
-    total_multiplier_range: [0.02, 0.15]
-  train:
-    max_updates: 10000       # Batch size, lr, weight decay and clipping use train above.
-    validate_every: 1000
-    validation_samples: 128
-    validation_calls: 16
-    inner_rollout:
-      weight: 1.0
-      calls: [1, 2, 4]
-      residual_weight: 1.0
-      position_weight: 1.0   # Same physical position for every exact multiplier allocation.
-  evaluation:
-    calls: [4, 8, 16, 32]
-    samples_per_qp: 256
-    batch_size: 512
-    projections: 32          # Conditional empirical sliced Wasserstein-1 directions.
-    tolerance: 0.001
-    position_tolerance: 0.001
-    timing_repeats: 3
-    hybrid: false            # Optional: PGS finishing can change the allocation distribution.
-    render: true
+# Large-circle evaluation of the existing D checkpoint. Training is unchanged.
+# Run eval_multiplier_stress.py; snapshot compares exactly the same QP.
+stress:
+  mode: snapshot
+  pgs_backend: sparse_cpu   # Compiled sequential PGS, shared by baseline and hybrid finish.
+  sizes: [256, 512, 1024, 2048]
+  scenes: [pile_drop, pile_impact, pile_shear]
+  seeds: [42, 43, 44]
+  hybrid_calls: [4, 8, 16]
+  tolerance: 0.001
+  max_sweeps: 10000
+  timing_repeats: 3
+  steps: 300                # Used by --mode rollout.
+  radius: 0.45              # Preserve the original physical scale and box width.
+  spacing_gap: 0.002
+  max_speed: 100.0
+  max_position: 100.0
+  render: true              # Two-panel PGS/hybrid GIFs in rollout mode.
+  image_size: 640
+  frame_stride: 5
