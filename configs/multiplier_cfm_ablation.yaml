@@ -102,3 +102,37 @@ rollout:
   render: true
   max_speed: 100.0
   max_position: 100.0
+
+# Separate synthetic experiment; does not change the original D pair cache or
+# training objective. Use train/eval_multiplier_distribution.py.
+distribution:
+  target: uniform_simplex    # D_distribution_point selects the exact barycenter.
+  source_scale: 1.0          # Uniform(0, source_scale * length_scale / D_ii).
+  data:
+    base_contacts: [2, 4, 8]
+    duplicates: [2, 3]
+    train_per_setting: 128
+    val_per_setting: 4
+    test_per_setting: 8
+    inverse_mass_range: [0.5, 2.0]
+    total_multiplier_range: [0.02, 0.15]
+  train:
+    max_updates: 10000       # Batch size, lr, weight decay and clipping use train above.
+    validate_every: 1000
+    validation_samples: 128
+    validation_calls: 16
+    inner_rollout:
+      weight: 1.0
+      calls: [1, 2, 4]
+      residual_weight: 1.0
+      position_weight: 1.0   # Same physical position for every exact multiplier allocation.
+  evaluation:
+    calls: [4, 8, 16, 32]
+    samples_per_qp: 256
+    batch_size: 512
+    projections: 32          # Conditional empirical sliced Wasserstein-1 directions.
+    tolerance: 0.001
+    position_tolerance: 0.001
+    timing_repeats: 3
+    hybrid: false            # Optional: PGS finishing can change the allocation distribution.
+    render: true
